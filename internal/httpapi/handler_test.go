@@ -98,6 +98,11 @@ func TestVerify_422Cases(t *testing.T) {
 		{"轴距低于下限", `{"axle_loads_kg":[1,1],"axle_spacings_mm":[499]}`},
 		{"四轴组非法", `{"axle_loads_kg":[1,1,1,1],"axle_spacings_mm":[1800,1800,1800]}`},
 		{"两个 JSON 文档", `{"axle_loads_kg":[1],"axle_spacings_mm":[]}{}`},
+		{"合法对象后多余右方括号", `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}]`},
+		{"合法对象后多余右花括号", `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}}`},
+		{"合法对象后多余数字", `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}1`},
+		{"合法对象后多余字符串", `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}"x"`},
+		{"合法对象后多余逗号", `{"axle_loads_kg":[1],"axle_spacings_mm":[]},`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,6 +114,18 @@ func TestVerify_422Cases(t *testing.T) {
 			assert.NotContains(t, out, "vehicle")
 			assert.NotContains(t, out, "violations")
 		})
+	}
+}
+
+func TestVerify_TrailingWhitespaceAccepted(t *testing.T) {
+	r := newRouter(t)
+	for _, body := range []string{
+		`{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}`,
+		`{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}` + "\n",
+		`  {"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}  ` + "\r\n\t",
+	} {
+		code, _ := doVerify(t, r, body)
+		assert.Equal(t, http.StatusOK, code, "仅尾随空白必须接受: %q", body)
 	}
 }
 

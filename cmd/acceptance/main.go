@@ -158,6 +158,28 @@ func main() {
 		return nil
 	})
 
+	// 合法对象后多写右方括号（及其他尾随垃圾）：必须 422 拒绝，不得给出裁决。
+	check("合法对象后多余右括号时返回 422", func() error {
+		for _, suffix := range []string{"]", "}", "1", ",\n"} {
+			raw := []byte(`{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}` + suffix)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/verify", bytes.NewReader(raw))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return fmt.Errorf("后缀 %q 请求失败: %w", suffix, err)
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnprocessableEntity {
+				return fmt.Errorf("后缀 %q 期望 422，实际 %d，响应 %s", suffix, resp.StatusCode, body)
+			}
+			if bytes.Contains(body, []byte("groups")) {
+				return fmt.Errorf("后缀 %q 的 422 夹带了裁决结果: %s", suffix, body)
+			}
+		}
+		return nil
+	})
+
 	// 同一请求两次，原始响应必须逐字节一致（可重复、唯一执法结论）。
 	check("相同输入两次响应逐字节一致", func() error {
 		req := map[string]any{

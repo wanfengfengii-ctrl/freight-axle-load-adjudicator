@@ -50,8 +50,16 @@ func handleVerify(c *gin.Context) {
 		respond422(c, describeDecodeError(err))
 		return
 	}
-	if dec.More() {
-		respond422(c, "请求体中存在多个 JSON 文档，只允许一个对象")
+	// 顶层必须恰好只有一个 JSON 值，再解码一次时合法请求只能得到 io.EOF。
+	// 不能用 dec.More()：它只反映数组/对象上下文内是否还有元素，
+	// 对顶层孤立的右括号（如 "...}]"）会漏判。
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			respond422(c, "请求体中存在多个 JSON 值，只允许一个 JSON 对象")
+			return
+		}
+		respond422(c, describeDecodeError(err))
 		return
 	}
 	if req.AxleLoadsKg == nil {
