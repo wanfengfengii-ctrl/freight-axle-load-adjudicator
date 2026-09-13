@@ -405,3 +405,277 @@ func TestEvaluateWithScale_InvalidAxleInputStillRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, res)
 }
+
+func intPtr(v int) *int { return &v }
+
+func TestCompareRetest_IdenticalMeasurementsConfirm(t *testing.T) {
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{9500, 9500},
+		AxleSpacingsMm: []int{1801},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9500, 9500},
+		AxleSpacingsMm: []int{1801},
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+	require.NotNil(t, cmp)
+
+	assert.Equal(t, ConclusionConfirmed, cmp.Conclusion)
+	assert.Empty(t, cmp.GroupBoundaryChanges)
+	assert.Empty(t, cmp.OverLimitChanges)
+	assert.Nil(t, cmp.VehicleConclusionChange)
+
+	// 两份完整裁决各自独立给出，且与分别调用既有裁决链路的结果一致。
+	want, err := Evaluate([]int{9500, 9500}, []int{1801})
+	require.NoError(t, err)
+	assert.Equal(t, want, cmp.FirstResult)
+	assert.Equal(t, want, cmp.RetestResult)
+	assert.Nil(t, cmp.FirstResult.Calibration)
+	assert.Nil(t, cmp.RetestResult.Calibration)
+}
+
+func TestCompareRetest_LoadChangeFlipsGroupOverLimit(t *testing.T) {
+	// 同样的双轴组分组（1800mm 同组）：首次 18000 恰好合规，
+	// 重测 18400 超限；分组边界不变，仅轴覆盖区间超限状态翻转。
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{9000, 9000},
+		AxleSpacingsMm: []int{1800},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9200, 9200},
+		AxleSpacingsMm: []int{1800},
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+
+	assert.Equal(t, ConclusionChanged, cmp.Conclusion)
+	assert.Empty(t, cmp.GroupBoundaryChanges, "轴距未变，分组边界不应变化")
+	require.Len(t, cmp.OverLimitChanges, 1)
+	change := cmp.OverLimitChanges[0]
+	assert.Equal(t, 1, change.StartAxle)
+	assert.Equal(t, 2, change.EndAxle)
+	assert.False(t, change.FirstOverLimit)
+	assert.True(t, change.RetestOverLimit)
+	assert.Nil(t, cmp.VehicleConclusionChange, "两侧整车总重均不超 49000")
+
+	// 两份完整裁决都在。
+	assert.False(t, cmp.FirstResult.Groups[0].OverLimit)
+	assert.True(t, cmp.RetestResult.Groups[0].OverLimit)
+	assert.Equal(t, []Violation{{Scope: "group", Index: 1}}, cmp.RetestResult.Violations)
+}
+
+func TestCompareRetest_SpacingChangeRegroups(t *testing.T) {
+	// 载荷不变：首次 1800mm 两轴同组且双轴组 19000 超限；
+	// 重测 1801mm 拆成两个合规单轴组。
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{9500, 9500},
+		AxleSpacingsMm: []int{1800},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9500, 9500},
+		AxleSpacingsMm: []int{1801},
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+
+	assert.Equal(t, ConclusionChanged, cmp.Conclusion)
+	require.Len(t, cmp.GroupBoundaryChanges, 1)
+	bc := cmp.GroupBoundaryChanges[0]
+	assert.Equal(t, 1, bc.StartAxle)
+	assert.Equal(t, 2, bc.EndAxle)
+	assert.Equal(t, []AxleRange{{StartAxle: 1, EndAxle: 2}}, bc.FirstGroups)
+	assert.Equal(t, []AxleRange{{StartAxle: 1, EndAxle: 1}, {StartAxle: 2, EndAxle: 2}}, bc.RetestGroups)
+
+	// 边界重排伴随两轴的超限状态翻转，合并为一个 1-2 区间。
+	require.Len(t, cmp.OverLimitChanges, 1)
+	oc := cmp.OverLimitChanges[0]
+	assert.Equal(t, 1, oc.StartAxle)
+	assert.Equal(t, 2, oc.EndAxle)
+	assert.True(t, oc.FirstOverLimit)
+	assert.False(t, oc.RetestOverLimit)
+	assert.Nil(t, cmp.VehicleConclusionChange)
+}
+
+func TestCompareRetest_MultipleBoundarySegmentsSortedByStartAxle(t *testing.T) {
+	// 5 轴：首次 (1,2)(3,4)(5)，重测全部拆成单轴组。
+	// 边界变化只发生在区间 1-2 与 3-4，第 5 轴两侧均为单轴组、不变化。
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{1, 1, 1, 1, 1},
+		AxleSpacingsMm: []int{1800, 1801, 1800, 1801},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{1, 1, 1, 1, 1},
+		AxleSpacingsMm: []int{1801, 1801, 1801, 1801},
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+	assert.Equal(t, ConclusionChanged, cmp.Conclusion)
+	require.Len(t, cmp.GroupBoundaryChanges, 2)
+	assert.Equal(t, [2]int{1, 2}, [2]int{cmp.GroupBoundaryChanges[0].StartAxle, cmp.GroupBoundaryChanges[0].EndAxle})
+	assert.Equal(t, [2]int{3, 4}, [2]int{cmp.GroupBoundaryChanges[1].StartAxle, cmp.GroupBoundaryChanges[1].EndAxle})
+	// 第 5 轴不出现在任何变化区间中。
+	for _, bc := range cmp.GroupBoundaryChanges {
+		assert.LessOrEqual(t, bc.EndAxle, 4)
+	}
+}
+
+func TestCompareRetest_OverLimitChangesSortedAndNotMergedAcrossSameStatus(t *testing.T) {
+	// 全部单轴组：首次第 1、2 轴超限；重测第 2、3 轴超限。
+	// 第 1 轴 超→合规，第 2 轴 超→超（不变），第 3 轴 合规→超：
+	// 必须得到两个独立区间 [1,1] 与 [3,3]，按首轴序号排序。
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{10001, 10001, 5000},
+		AxleSpacingsMm: []int{1801, 1801},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9000, 10001, 10001},
+		AxleSpacingsMm: []int{1801, 1801},
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+	assert.Empty(t, cmp.GroupBoundaryChanges)
+	require.Len(t, cmp.OverLimitChanges, 2)
+	assert.Equal(t, OverLimitChange{StartAxle: 1, EndAxle: 1, FirstOverLimit: true, RetestOverLimit: false},
+		cmp.OverLimitChanges[0])
+	assert.Equal(t, OverLimitChange{StartAxle: 3, EndAxle: 3, FirstOverLimit: false, RetestOverLimit: true},
+		cmp.OverLimitChanges[1])
+}
+
+func TestCompareRetest_VehicleConclusionFlipOnly(t *testing.T) {
+	// 5 个单轴组：首次合计 49050 整车超限、各组合规；
+	// 重测合计 49000 恰好合规。无分组变化、无区间超限翻转，仅整车结论翻转。
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{9810, 9810, 9810, 9810, 9810},
+		AxleSpacingsMm: []int{1801, 1801, 1801, 1801},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9800, 9800, 9800, 9800, 9800},
+		AxleSpacingsMm: []int{1801, 1801, 1801, 1801},
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+	assert.Equal(t, ConclusionChanged, cmp.Conclusion)
+	assert.Empty(t, cmp.GroupBoundaryChanges)
+	assert.Empty(t, cmp.OverLimitChanges)
+	require.NotNil(t, cmp.VehicleConclusionChange)
+	assert.Equal(t, 49050, cmp.VehicleConclusionChange.FirstLoadKg)
+	assert.Equal(t, 49000, cmp.VehicleConclusionChange.RetestLoadKg)
+	assert.True(t, cmp.VehicleConclusionChange.FirstOverLimit)
+	assert.False(t, cmp.VehicleConclusionChange.RetestOverLimit)
+}
+
+func TestCompareRetest_OptionalScaleWeightGoesThroughCalibrationChain(t *testing.T) {
+	// 首次不带地磅：双轴组 18400 超限；重测同载荷携带地磅 18000，
+	// 校准为 [9000,9000] 后合规——比对必须识别翻转，且只有重测结果带校准信息。
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{9200, 9200},
+		AxleSpacingsMm: []int{1800},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9200, 9200},
+		AxleSpacingsMm: []int{1800},
+		ScaleWeightKg:  intPtr(18000),
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+	assert.Equal(t, ConclusionChanged, cmp.Conclusion)
+	require.Len(t, cmp.OverLimitChanges, 1)
+	assert.True(t, cmp.OverLimitChanges[0].FirstOverLimit)
+	assert.False(t, cmp.OverLimitChanges[0].RetestOverLimit)
+	assert.Nil(t, cmp.FirstResult.Calibration)
+	require.NotNil(t, cmp.RetestResult.Calibration)
+	assert.Equal(t, []int{9000, 9000}, cmp.RetestResult.Calibration.CalibratedLoadsKg)
+}
+
+func TestCompareRetest_BothMayCarryScaleWeight(t *testing.T) {
+	// 两份都携带地磅重量且结论一致：确认，且两份结果都带各自的校准信息。
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{9200, 9200},
+		AxleSpacingsMm: []int{1800},
+		ScaleWeightKg:  intPtr(18000),
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9200, 9200},
+		AxleSpacingsMm: []int{1800},
+		ScaleWeightKg:  intPtr(18000),
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.NoError(t, err)
+	assert.Equal(t, ConclusionConfirmed, cmp.Conclusion)
+	assert.NotNil(t, cmp.FirstResult.Calibration)
+	assert.NotNil(t, cmp.RetestResult.Calibration)
+}
+
+func TestCompareRetest_AxleCountMismatch(t *testing.T) {
+	first := RetestMeasurement{
+		AxleLoadsKg:    []int{9500, 9500},
+		AxleSpacingsMm: []int{1801},
+	}
+	retest := RetestMeasurement{
+		AxleLoadsKg:    []int{9500, 9500, 9500},
+		AxleSpacingsMm: []int{1801, 1801},
+	}
+	cmp, err := CompareRetest(first, retest)
+	require.Error(t, err)
+	assert.Nil(t, cmp)
+	assert.Contains(t, err.Error(), "轴数不一致")
+	assert.Contains(t, err.Error(), "2")
+	assert.Contains(t, err.Error(), "3")
+}
+
+func TestCompareRetest_InvalidMeasurementRejectedWithSide(t *testing.T) {
+	valid := RetestMeasurement{
+		AxleLoadsKg:    []int{9500, 9500},
+		AxleSpacingsMm: []int{1801},
+	}
+	cases := []struct {
+		name      string
+		first     RetestMeasurement
+		retest    RetestMeasurement
+		sideLabel string
+	}{
+		{
+			"首次载荷越界",
+			RetestMeasurement{AxleLoadsKg: []int{0, 1}, AxleSpacingsMm: []int{1000}},
+			valid,
+			"首次",
+		},
+		{
+			"重测轴距越界",
+			valid,
+			RetestMeasurement{AxleLoadsKg: []int{1, 1}, AxleSpacingsMm: []int{10001}},
+			"重测",
+		},
+		{
+			"首次轴距项数不符",
+			RetestMeasurement{AxleLoadsKg: []int{1, 2, 3}, AxleSpacingsMm: []int{1000}},
+			valid,
+			"首次",
+		},
+		{
+			"首次形成四轴组（裁决期非法）",
+			RetestMeasurement{AxleLoadsKg: []int{1, 1, 1, 1}, AxleSpacingsMm: []int{1800, 1800, 1800}},
+			valid,
+			"首次",
+		},
+		{
+			"重测地磅偏差超 5%",
+			valid,
+			RetestMeasurement{
+				AxleLoadsKg:    []int{10000, 10000},
+				AxleSpacingsMm: []int{1801},
+				ScaleWeightKg:  intPtr(21001),
+			},
+			"重测",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmp, err := CompareRetest(tc.first, tc.retest)
+			require.Error(t, err)
+			assert.Nil(t, cmp, "非法输入不得给出任何部分结果")
+			assert.Contains(t, err.Error(), tc.sideLabel)
+		})
+	}
+}

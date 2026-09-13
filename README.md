@@ -39,7 +39,8 @@ docker compose down
 
 Compose 中定义了名为 **`verify`** 的一次性服务：它等待 API 就绪后执行黑盒验收
 （1800/1801 临界两侧结论翻转、四轴组 422 且无部分结果、相同输入响应逐字节一致、
-地磅校准后超限结论翻转、偏差超 5% 拒绝、未携带地磅重量的响应逐字节回归等），
+地磅校准后超限结论翻转、偏差超 5% 拒绝、未携带地磅重量的响应逐字节回归，以及
+重测比对的两次一致确认、载荷变化超限翻转、轴距变化分组重排、第二份非法无部分结果等），
 全部通过则退出码 0。
 
 ```bash
@@ -194,6 +195,66 @@ curl -s -X POST localhost:8080/api/v1/verify \
 
 返回 `200 {"status":"ok"}`，供容器探活与验收服务等待就绪使用。
 
+### `POST /api/v1/retest-comparison`（夜间重测比对）
+
+夜间执法完成首次称重后，复核员常会要求车辆重新停稳再测一次。本入口接收**同一车辆**
+的首次与重测两份数据，分别调用既有裁决链路后返回两份**完整裁决结果**，并自动给出
+两份结论是否一致，无需人工比对两份响应。
+
+- 请求体为单个 JSON 对象，包含 `first`（首次称重）与 `retest`（重测）两个字段，
+  二者各自是一个与 `/api/v1/verify` **字段契约完全相同**的对象
+  （`axle_loads_kg`、`axle_spacings_mm` 必填，`scale_weight_kg` 选填，
+  未知字段一律拒绝）。
+- 两份数据的**轴数必须相同**。
+
+任一份数据非法（含未知字段、缺字段、数值越界、四轴组、地磅偏差超 5% 等）
+或两份轴数不一致时，**整体返回 HTTP 422**，错误信息明确指出是
+**“首次称重数据”还是“重测数据”**及具体原因，且**绝不夹带另一份裁决结果**。
+
+```bash
+curl -s -X POST localhost:8080/api/v1/retest-comparison \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first":  {"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]},
+    "retest": {"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}
+  }'
+```
+
+成功响应（HTTP 200）依次包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `first_result` / `retest_result` | 两次称重各自的**完整裁决结果**，结构与单次裁决响应逐字段一致（携带地磅重量时各自带 `calibration`） |
+| `group_boundary_changes` | **分组边界发生变化**的轴覆盖区间；每项给出区间 `start_axle`/`end_axle`，以及首次与重测在该区间内的分组覆盖 `first_groups` / `retest_groups` |
+| `over_limit_changes` | **超限状态发生翻转**的轴覆盖区间（按轴逐轴比对“所属轴组是否超限”后合并连续同状态轴）；给出两侧 `first_over_limit` / `retest_over_limit` |
+| `vehicle_conclusion_change` | 仅在**整车超限结论翻转**时出现，携带两侧整车总重与超限标志；否则缺省 |
+| `conclusion` | **`结论确认`**（无任何变化）或 **`结论改变`**（任一分组边界、区间超限状态或整车结论变化） |
+
+`group_boundary_changes` 与 `over_limit_changes` 的所有条目均按**首轴序号稳定升序**
+（车头方向）排列；无变化时为空数组 `[]`。
+
+上例（1800mm 双轴超限组 vs 1801mm 两个合规单轴组）的响应要点：
+
+```json
+{
+  "first_result":  { "groups": [ {"start_axle":1,"end_axle":2,"over_limit":true} ] },
+  "retest_result": { "groups": [ {"start_axle":1,"end_axle":1,"over_limit":false},
+                                 {"start_axle":2,"end_axle":2,"over_limit":false} ] },
+  "group_boundary_changes": [
+    { "start_axle": 1, "end_axle": 2,
+      "first_groups":  [ {"start_axle":1,"end_axle":2} ],
+      "retest_groups": [ {"start_axle":1,"end_axle":1}, {"start_axle":2,"end_axle":2} ] }
+  ],
+  "over_limit_changes": [
+    { "start_axle": 1, "end_axle": 2, "first_over_limit": true, "retest_over_limit": false }
+  ],
+  "conclusion": "结论改变"
+}
+```
+
+比对入口不改变单次裁决的任何行为：`POST /api/v1/verify` 的请求/响应字节、
+校准行为、`GET /healthz` 与 `API_PORT` 覆盖均保持原样。
+
 ---
 
 ## 3. 项目结构
@@ -223,3 +284,5 @@ docker-compose.yml          api 常驻服务 + verify 一次性验收服务
 | 差额分摊 | 按原载荷比例向下取整，余数按小数部分降序、轴序号升序逐轴补 1 |
 | 超限清单顺序 | 组按序号升序，整车固定最后 |
 | 非法输入 | 一律 422，仅 `{"error": ...}`，无部分结果 |
+| 重测比对 | `POST /api/v1/retest-comparison`：两份同契约数据、轴数须相同，各走既有裁决链路；返回两份完整结果、按首轴排序的分组边界/超限状态变化区间、整车结论翻转与最终 `结论确认`/`结论改变` |
+| 重测比对非法 | 任一份非法或轴数不一致整体 422，错误指明首次或重测，不夹带另一份裁决结果 |

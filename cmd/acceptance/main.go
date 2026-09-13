@@ -1,5 +1,6 @@
 // Command acceptance 是一次性黑盒验收程序：等待服务就绪后，对运行中的 API
-// 执行 1800/1801 毫米临界两侧、非法输入 422 与可重复性检查，全部通过才以 0 退出。
+// 执行 1800/1801 毫米临界两侧、非法输入 422、可重复性、地磅校准以及重测比对
+// （两次一致确认、载荷翻转、轴距重排、第二份非法无部分结果）检查，全部通过才以 0 退出。
 package main
 
 import (
@@ -335,6 +336,266 @@ func main() {
 			}
 			if string(body) != tc.want {
 				return fmt.Errorf("%s 响应发生变化:\n期望 %s\n实际 %s", tc.name, tc.want, body)
+			}
+		}
+		return nil
+	})
+
+	// ---- 重测比对入口 POST /api/v1/retest-comparison ----
+
+	// 场景一：两次完全一致 -> 结论确认，无任何变化项，且两份完整结果与单次
+	// 裁决入口对同一输入的响应逐字节一致（嵌在 first_result/retest_result 下）。
+	check("重测比对：两次一致时结论确认且两份结果完整", func() error {
+		measurement := map[string]any{
+			"axle_loads_kg":    []int{20000, 20000, 10000},
+			"axle_spacings_mm": []int{1801, 1801},
+		}
+		standaloneCode, standalone, err := postJSON(ctx, client, base+"/api/v1/verify", measurement)
+		if err != nil {
+			return err
+		}
+		if standaloneCode != http.StatusOK {
+			return fmt.Errorf("对照裁决期望 200，实际 %d，响应 %s", standaloneCode, standalone)
+		}
+
+		code, body, err := postJSON(ctx, client, base+"/api/v1/retest-comparison",
+			map[string]any{"first": measurement, "retest": measurement})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			FirstResult          json.RawMessage `json:"first_result"`
+			RetestResult         json.RawMessage `json:"retest_result"`
+			GroupBoundaryChanges []any           `json:"group_boundary_changes"`
+			OverLimitChanges     []any           `json:"over_limit_changes"`
+			VehicleChange        json.RawMessage `json:"vehicle_conclusion_change"`
+			Conclusion           string          `json:"conclusion"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		if got.Conclusion != "结论确认" {
+			return fmt.Errorf("期望结论确认，实际 %q，响应 %s", got.Conclusion, body)
+		}
+		if len(got.GroupBoundaryChanges) != 0 || len(got.OverLimitChanges) != 0 {
+			return fmt.Errorf("两次一致时不应有变化项，响应 %s", body)
+		}
+		if len(got.VehicleChange) != 0 {
+			return fmt.Errorf("整车结论未翻转时不应出现 vehicle_conclusion_change，响应 %s", body)
+		}
+		if !bytes.Equal(bytes.TrimSpace(got.FirstResult), bytes.TrimSpace(standalone)) ||
+			!bytes.Equal(bytes.TrimSpace(got.RetestResult), bytes.TrimSpace(standalone)) {
+			return fmt.Errorf("嵌套结果与单次裁决不一致:\n单次 %s\n首次 %s\n重测 %s",
+				standalone, got.FirstResult, got.RetestResult)
+		}
+		if !bytes.Contains(body, []byte(`"first_result":`+string(standalone))) {
+			return fmt.Errorf("first_result 未与单次裁决响应逐字节一致:\n单次 %s\n响应 %s", standalone, body)
+		}
+		return nil
+	})
+
+	// 场景二：载荷变化导致超限翻转（分组不变）：1800mm 双轴组 18000 合规 -> 18400 超限。
+	check("重测比对：载荷变化导致超限翻转", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/retest-comparison", map[string]any{
+			"first": map[string]any{
+				"axle_loads_kg":    []int{9000, 9000},
+				"axle_spacings_mm": []int{1800},
+			},
+			"retest": map[string]any{
+				"axle_loads_kg":    []int{9200, 9200},
+				"axle_spacings_mm": []int{1800},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			GroupBoundaryChanges []any `json:"group_boundary_changes"`
+			OverLimitChanges     []struct {
+				StartAxle       int  `json:"start_axle"`
+				EndAxle         int  `json:"end_axle"`
+				FirstOverLimit  bool `json:"first_over_limit"`
+				RetestOverLimit bool `json:"retest_over_limit"`
+			} `json:"over_limit_changes"`
+			VehicleChange json.RawMessage `json:"vehicle_conclusion_change"`
+			Conclusion    string          `json:"conclusion"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		if got.Conclusion != "结论改变" {
+			return fmt.Errorf("期望结论改变，实际 %q", got.Conclusion)
+		}
+		if len(got.GroupBoundaryChanges) != 0 {
+			return fmt.Errorf("轴距未变不应有分组边界变化: %s", body)
+		}
+		if len(got.OverLimitChanges) != 1 {
+			return fmt.Errorf("期望恰好 1 个超限翻转区间，实际 %d: %s", len(got.OverLimitChanges), body)
+		}
+		oc := got.OverLimitChanges[0]
+		if oc.StartAxle != 1 || oc.EndAxle != 2 || oc.FirstOverLimit || !oc.RetestOverLimit {
+			return fmt.Errorf("超限翻转区间不符: %+v", oc)
+		}
+		if len(got.VehicleChange) != 0 {
+			return fmt.Errorf("两侧整车均不超限，不应有整车结论变化: %s", body)
+		}
+		return nil
+	})
+
+	// 场景三：轴距变化导致分组重排：1800mm 双轴超限组 -> 1801mm 两个合规单轴组。
+	check("重测比对：轴距变化导致分组重排", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/retest-comparison", map[string]any{
+			"first": map[string]any{
+				"axle_loads_kg":    []int{9500, 9500},
+				"axle_spacings_mm": []int{1800},
+			},
+			"retest": map[string]any{
+				"axle_loads_kg":    []int{9500, 9500},
+				"axle_spacings_mm": []int{1801},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			GroupBoundaryChanges []struct {
+				StartAxle   int `json:"start_axle"`
+				EndAxle     int `json:"end_axle"`
+				FirstGroups []struct {
+					StartAxle int `json:"start_axle"`
+					EndAxle   int `json:"end_axle"`
+				} `json:"first_groups"`
+				RetestGroups []struct {
+					StartAxle int `json:"start_axle"`
+					EndAxle   int `json:"end_axle"`
+				} `json:"retest_groups"`
+			} `json:"group_boundary_changes"`
+			OverLimitChanges []struct {
+				StartAxle       int  `json:"start_axle"`
+				EndAxle         int  `json:"end_axle"`
+				FirstOverLimit  bool `json:"first_over_limit"`
+				RetestOverLimit bool `json:"retest_over_limit"`
+			} `json:"over_limit_changes"`
+			Conclusion string `json:"conclusion"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		if got.Conclusion != "结论改变" {
+			return fmt.Errorf("期望结论改变，实际 %q", got.Conclusion)
+		}
+		if len(got.GroupBoundaryChanges) != 1 {
+			return fmt.Errorf("期望 1 个分组边界变化区间，实际 %d: %s", len(got.GroupBoundaryChanges), body)
+		}
+		bc := got.GroupBoundaryChanges[0]
+		if bc.StartAxle != 1 || bc.EndAxle != 2 {
+			return fmt.Errorf("边界变化区间应为 1-2，实际 %d-%d", bc.StartAxle, bc.EndAxle)
+		}
+		if len(bc.FirstGroups) != 1 || bc.FirstGroups[0].StartAxle != 1 || bc.FirstGroups[0].EndAxle != 2 {
+			return fmt.Errorf("首次分组覆盖应为 [1,2]，实际 %+v", bc.FirstGroups)
+		}
+		if len(bc.RetestGroups) != 2 ||
+			bc.RetestGroups[0].StartAxle != 1 || bc.RetestGroups[0].EndAxle != 1 ||
+			bc.RetestGroups[1].StartAxle != 2 || bc.RetestGroups[1].EndAxle != 2 {
+			return fmt.Errorf("重测分组覆盖应为 [1,1][2,2]，实际 %+v", bc.RetestGroups)
+		}
+		if len(got.OverLimitChanges) != 1 {
+			return fmt.Errorf("期望 1 个超限翻转区间，实际 %d", len(got.OverLimitChanges))
+		}
+		oc := got.OverLimitChanges[0]
+		if oc.StartAxle != 1 || oc.EndAxle != 2 || !oc.FirstOverLimit || oc.RetestOverLimit {
+			return fmt.Errorf("超限翻转区间应为 1-2 且 超→合规，实际 %+v", oc)
+		}
+		return nil
+	})
+
+	// 场景四：第二份非法（地磅偏差超 5%）-> 整体 422，错误指明重测，且无任何部分结果。
+	check("重测比对：第二份非法时 422 且无部分结果", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/retest-comparison", map[string]any{
+			"first": map[string]any{
+				"axle_loads_kg":    []int{20000, 20000, 10000},
+				"axle_spacings_mm": []int{1801, 1801},
+			},
+			"retest": map[string]any{
+				"axle_loads_kg":    []int{10000, 10000},
+				"axle_spacings_mm": []int{1801},
+				"scale_weight_kg":  21001,
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusUnprocessableEntity {
+			return fmt.Errorf("期望 422，实际 %d，响应 %s", code, body)
+		}
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+			return fmt.Errorf("422 响应缺少 error 字段: %s", body)
+		}
+		if !bytes.Contains(body, []byte("重测")) {
+			return fmt.Errorf("错误应指出非法的是重测数据，实际 %q", errResp.Error)
+		}
+		for _, kw := range []string{"first_result", "retest_result", "groups",
+			"vehicle", "violations", "calibration", "conclusion"} {
+			if bytes.Contains(body, []byte(kw)) {
+				return fmt.Errorf("422 响应夹带了部分结果（%s）: %s", kw, body)
+			}
+		}
+		return nil
+	})
+
+	// 轴数不一致同样整体 422；未知字段在顶层与任一份数据内均被拒绝。
+	check("重测比对：轴数不一致与未知字段返回 422", func() error {
+		cases := []struct {
+			name    string
+			payload map[string]any
+		}{
+			{
+				"轴数不一致",
+				map[string]any{
+					"first":  map[string]any{"axle_loads_kg": []int{1, 2}, "axle_spacings_mm": []int{1000}},
+					"retest": map[string]any{"axle_loads_kg": []int{1, 2, 3}, "axle_spacings_mm": []int{1000, 1000}},
+				},
+			},
+			{
+				"顶层未知字段",
+				map[string]any{
+					"first":  map[string]any{"axle_loads_kg": []int{1}, "axle_spacings_mm": []int{}},
+					"retest": map[string]any{"axle_loads_kg": []int{1}, "axle_spacings_mm": []int{}},
+					"extra":  1,
+				},
+			},
+			{
+				"首次数据未知字段",
+				map[string]any{
+					"first":  map[string]any{"axle_loads_kg": []int{1}, "axle_spacings_mm": []int{}, "extra": 1},
+					"retest": map[string]any{"axle_loads_kg": []int{1}, "axle_spacings_mm": []int{}},
+				},
+			},
+		}
+		for _, tc := range cases {
+			code, body, err := postJSON(ctx, client, base+"/api/v1/retest-comparison", tc.payload)
+			if err != nil {
+				return fmt.Errorf("%s: %w", tc.name, err)
+			}
+			if code != http.StatusUnprocessableEntity {
+				return fmt.Errorf("%s 期望 422，实际 %d，响应 %s", tc.name, code, body)
+			}
+			for _, kw := range []string{"first_result", "retest_result", "conclusion"} {
+				if bytes.Contains(body, []byte(kw)) {
+					return fmt.Errorf("%s 的 422 夹带了部分结果（%s）: %s", tc.name, kw, body)
+				}
 			}
 		}
 		return nil

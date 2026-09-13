@@ -71,6 +71,64 @@ type Result struct {
 	Calibration *CalibrationResult `json:"calibration,omitempty"` // 仅携带地磅重量的请求存在
 }
 
+// 比对结论：两份裁决均合法且执法结论一致时为“结论确认”，
+// 任一分组边界、轴覆盖区间超限状态或整车结论发生变化时为“结论改变”。
+const (
+	ConclusionConfirmed = "结论确认"
+	ConclusionChanged   = "结论改变"
+)
+
+// RetestMeasurement 为一次称重测量的输入，字段契约与单次裁决完全一致：
+// 轴载荷、相邻轴距必填，ScaleWeightKg 为可选地磅整车重量（nil 表示不校准）。
+type RetestMeasurement struct {
+	AxleLoadsKg    []int
+	AxleSpacingsMm []int
+	ScaleWeightKg  *int
+}
+
+// AxleRange 为轴覆盖闭区间（轴序号 1 基，首尾轴均含）。
+type AxleRange struct {
+	StartAxle int `json:"start_axle"` // 区间首轴序号
+	EndAxle   int `json:"end_axle"`   // 区间尾轴序号
+}
+
+// GroupBoundaryChange 标识首次与重测之间分组边界发生变化的轴覆盖区间，
+// 并分别给出两份裁决在该区间内的分组覆盖（已按区间裁剪，按首轴序号排序）。
+type GroupBoundaryChange struct {
+	StartAxle    int         `json:"start_axle"`
+	EndAxle      int         `json:"end_axle"`
+	FirstGroups  []AxleRange `json:"first_groups"`  // 首次裁决在该区间内的分组覆盖
+	RetestGroups []AxleRange `json:"retest_groups"` // 重测裁决在该区间内的分组覆盖
+}
+
+// OverLimitChange 标识一个轴覆盖区间上“轴是否属于超限轴组”的状态发生翻转，
+// 区间内每个轴在同一份裁决中的状态一致；分组重排时区间按轴逐轴比对后合并得出。
+type OverLimitChange struct {
+	StartAxle       int  `json:"start_axle"`
+	EndAxle         int  `json:"end_axle"`
+	FirstOverLimit  bool `json:"first_over_limit"`  // 区间在首次裁决中是否属于超限轴组
+	RetestOverLimit bool `json:"retest_over_limit"` // 区间在重测裁决中是否属于超限轴组
+}
+
+// VehicleConclusionChange 仅在整车超限结论翻转时出现，并携带两侧整车总重备查。
+type VehicleConclusionChange struct {
+	FirstLoadKg     int  `json:"first_load_kg"`
+	RetestLoadKg    int  `json:"retest_load_kg"`
+	FirstOverLimit  bool `json:"first_over_limit"`
+	RetestOverLimit bool `json:"retest_over_limit"`
+}
+
+// ComparisonResult 是同一车辆首次称重与重测的比对结果：
+// 两份完整裁决各自独立给出，随后只列变化项；无变化时各变化列表为空数组。
+type ComparisonResult struct {
+	FirstResult             *Result                  `json:"first_result"`
+	RetestResult            *Result                  `json:"retest_result"`
+	GroupBoundaryChanges    []GroupBoundaryChange    `json:"group_boundary_changes"`
+	OverLimitChanges        []OverLimitChange        `json:"over_limit_changes"`
+	VehicleConclusionChange *VehicleConclusionChange `json:"vehicle_conclusion_change,omitempty"`
+	Conclusion              string                   `json:"conclusion"`
+}
+
 // Validate 仅校验输入合法性，不产出裁决结果。
 func Validate(axleLoadsKg []int, axleSpacingsMm []int) error {
 	n := len(axleLoadsKg)
@@ -218,6 +276,207 @@ func absInt(v int) int {
 		return -v
 	}
 	return v
+}
+
+// evaluateMeasurement 按单次裁决契约执行一次测量：带地磅重量时先校准再裁决，
+// 否则直接裁决；任一步非法都返回 error，绝不产出部分结果。
+func evaluateMeasurement(m RetestMeasurement) (*Result, error) {
+	if m.ScaleWeightKg != nil {
+		return EvaluateWithScale(m.AxleLoadsKg, m.AxleSpacingsMm, *m.ScaleWeightKg)
+	}
+	return Evaluate(m.AxleLoadsKg, m.AxleSpacingsMm)
+}
+
+// CompareRetest 接收同一车辆的首次称重与重测数据，分别走既有裁决链路，
+// 再比对分组边界、各轴覆盖区间的超限状态与整车结论。
+// 任一份数据非法、或两份轴数不一致时返回 error；调用方必须整体拒绝，
+// 不得在错误中夹带另一份裁决结果。
+func CompareRetest(first, retest RetestMeasurement) (*ComparisonResult, error) {
+	// 先各做一次纯输入校验，轴数比对只看载荷项数：轴数须相同。
+	if err := Validate(first.AxleLoadsKg, first.AxleSpacingsMm); err != nil {
+		return nil, fmt.Errorf("首次称重数据非法：%s", err.Error())
+	}
+	if err := Validate(retest.AxleLoadsKg, retest.AxleSpacingsMm); err != nil {
+		return nil, fmt.Errorf("重测数据非法：%s", err.Error())
+	}
+	if len(first.AxleLoadsKg) != len(retest.AxleLoadsKg) {
+		return nil, fmt.Errorf("首次与重测轴数不一致：首次为 %d 轴，重测为 %d 轴",
+			len(first.AxleLoadsKg), len(retest.AxleLoadsKg))
+	}
+
+	firstResult, err := evaluateMeasurement(first)
+	if err != nil {
+		// 校验已先行通过，这里只可能是四轴组等裁决期非法情形。
+		return nil, fmt.Errorf("首次称重数据非法：%s", err.Error())
+	}
+	retestResult, err := evaluateMeasurement(retest)
+	if err != nil {
+		return nil, fmt.Errorf("重测数据非法：%s", err.Error())
+	}
+
+	axleCount := len(first.AxleLoadsKg)
+	boundaryChanges := diffGroupBoundaries(axleCount, first.AxleSpacingsMm, retest.AxleSpacingsMm,
+		firstResult.Groups, retestResult.Groups)
+	overLimitChanges := diffOverLimitByAxle(axleCount, firstResult.Groups, retestResult.Groups)
+
+	var vehicleChange *VehicleConclusionChange
+	if firstResult.Vehicle.OverLimit != retestResult.Vehicle.OverLimit {
+		vehicleChange = &VehicleConclusionChange{
+			FirstLoadKg:     firstResult.Vehicle.LoadKg,
+			RetestLoadKg:    retestResult.Vehicle.LoadKg,
+			FirstOverLimit:  firstResult.Vehicle.OverLimit,
+			RetestOverLimit: retestResult.Vehicle.OverLimit,
+		}
+	}
+
+	conclusion := ConclusionConfirmed
+	if len(boundaryChanges) > 0 || len(overLimitChanges) > 0 || vehicleChange != nil {
+		conclusion = ConclusionChanged
+	}
+	return &ComparisonResult{
+		FirstResult:             firstResult,
+		RetestResult:            retestResult,
+		GroupBoundaryChanges:    boundaryChanges,
+		OverLimitChanges:        overLimitChanges,
+		VehicleConclusionChange: vehicleChange,
+		Conclusion:              conclusion,
+	}, nil
+}
+
+// groupSpans 把裁决结果里的组转成 0 基闭区间列表，结果本身已按首轴排序。
+func groupSpans(groups []GroupResult) []axleSpan {
+	spans := make([]axleSpan, len(groups))
+	for i, g := range groups {
+		spans[i] = axleSpan{start: g.StartAxle - 1, end: g.EndAxle - 1}
+	}
+	return spans
+}
+
+// overlaps 判断两个闭区间是否相交。
+func overlaps(a, b axleSpan) bool {
+	return a.start <= b.end && b.start <= a.end
+}
+
+// clipTo 把区间 s 裁剪到 window 内，调用前须保证两者相交。
+func clipTo(s, window axleSpan) axleSpan {
+	return axleSpan{start: maxInt(s.start, window.start), end: minInt(s.end, window.end)}
+}
+
+// toRanges 将若干 0 基区间转成 1 基的 JSON 轴覆盖区间，均已按首轴排序。
+func toRanges(spans []axleSpan) []AxleRange {
+	ranges := make([]AxleRange, len(spans))
+	for i, s := range spans {
+		ranges[i] = AxleRange{StartAxle: s.start + 1, EndAxle: s.end + 1}
+	}
+	return ranges
+}
+
+// diffGroupBoundaries 按轴覆盖区间识别分组边界变化：
+// 逐项比较两侧相邻轴距是否为组间边界（>1800mm），把连续的“边界状态翻转”
+// 的相邻轴距所覆盖的车轴合并为一个变化段（等价于以翻转边界为边的最大连通轴段）；
+// 两侧同为边界或同为非边界的轴距不产生变化段。段内再分别给出两侧分组覆盖
+// （按区间裁剪）。结果按首轴序号（车头方向）稳定升序。
+func diffGroupBoundaries(axleCount int, firstSpacings, retestSpacings []int,
+	firstGroups, retestGroups []GroupResult) []GroupBoundaryChange {
+	boundary := func(spacings []int, sp int) bool { return spacings[sp] > SameGroupMaxMm }
+	boundaryChanged := func(sp int) bool {
+		return boundary(firstSpacings, sp) != boundary(retestSpacings, sp)
+	}
+
+	type segment struct{ start, end int }
+	segments := make([]segment, 0)
+	for sp := 0; sp < axleCount-1; {
+		if !boundaryChanged(sp) {
+			sp++
+			continue
+		}
+		start := sp
+		for sp < axleCount-1 && boundaryChanged(sp) {
+			sp++
+		}
+		// 翻转的间距从 start 连到 sp-1，覆盖车轴 start..sp。
+		segments = append(segments, segment{start: start, end: sp})
+	}
+
+	first := groupSpans(firstGroups)
+	retest := groupSpans(retestGroups)
+	changes := make([]GroupBoundaryChange, 0, len(segments))
+	for _, seg := range segments {
+		window := axleSpan{start: seg.start, end: seg.end}
+		var fParts, rParts []axleSpan
+		for _, s := range first {
+			if overlaps(s, window) {
+				fParts = append(fParts, clipTo(s, window))
+			}
+		}
+		for _, s := range retest {
+			if overlaps(s, window) {
+				rParts = append(rParts, clipTo(s, window))
+			}
+		}
+		changes = append(changes, GroupBoundaryChange{
+			StartAxle:    seg.start + 1,
+			EndAxle:      seg.end + 1,
+			FirstGroups:  toRanges(fParts),
+			RetestGroups: toRanges(rParts),
+		})
+	}
+	return changes
+}
+
+// diffOverLimitByAxle 把两侧“每个轴所属轴组是否超限”逐轴比对，
+// 再将状态相同的连续变化轴合并为轴覆盖区间，按首轴序号升序输出。
+func diffOverLimitByAxle(axleCount int, firstGroups, retestGroups []GroupResult) []OverLimitChange {
+	firstOver := make([]bool, axleCount)
+	retestOver := make([]bool, axleCount)
+	for _, g := range firstGroups {
+		if g.OverLimit {
+			for axle := g.StartAxle - 1; axle <= g.EndAxle-1; axle++ {
+				firstOver[axle] = true
+			}
+		}
+	}
+	for _, g := range retestGroups {
+		if g.OverLimit {
+			for axle := g.StartAxle - 1; axle <= g.EndAxle-1; axle++ {
+				retestOver[axle] = true
+			}
+		}
+	}
+
+	changes := make([]OverLimitChange, 0)
+	for axle := 0; axle < axleCount; {
+		if firstOver[axle] == retestOver[axle] {
+			axle++
+			continue
+		}
+		start := axle
+		fo, ro := firstOver[axle], retestOver[axle]
+		for axle < axleCount && firstOver[axle] == fo && retestOver[axle] == ro {
+			axle++
+		}
+		changes = append(changes, OverLimitChange{
+			StartAxle:       start + 1,
+			EndAxle:         axle,
+			FirstOverLimit:  fo,
+			RetestOverLimit: ro,
+		})
+	}
+	return changes
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // evaluate 对已校验的输入执行分组与裁决，axleLoadsKg 为实际参与裁决的载荷
