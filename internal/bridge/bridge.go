@@ -8,12 +8,15 @@ import (
 	"sort"
 )
 
-// 输入约束常量，单位见字段名。
+// 输入约束常量，单位见字段名。轴位置与轴载荷的上限同时保证全部整数运算
+// 不溢出：位移最大为 100000+50000 毫米，落桥载荷合计最大为 12×20000 千克。
 const (
 	MinAxles          = 1
 	MaxAxles          = 12
 	MinAxleLoadKg     = 1
+	MaxAxleLoadKg     = 20000 // 与轴组裁决的轴载荷上限一致
 	MinPositionMm     = 0
+	MaxPositionMm     = 100000 // 100 米，覆盖任何道路车辆长度
 	MinBridgeLengthMm = 1000
 	MaxBridgeLengthMm = 50000
 	MinApprovedLoadKg = 1
@@ -67,14 +70,15 @@ func Validate(in Input) error {
 			n, n, len(in.AxlePositionsMm))
 	}
 	for i, load := range in.AxleLoadsKg {
-		if load < MinAxleLoadKg {
-			return fmt.Errorf("第 %d 轴载荷 %d 必须不小于 %d 千克",
-				i+1, load, MinAxleLoadKg)
+		if load < MinAxleLoadKg || load > MaxAxleLoadKg {
+			return fmt.Errorf("第 %d 轴载荷 %d 超出允许范围 %d-%d 千克",
+				i+1, load, MinAxleLoadKg, MaxAxleLoadKg)
 		}
 	}
 	for i, pos := range in.AxlePositionsMm {
-		if pos < MinPositionMm {
-			return fmt.Errorf("第 %d 轴位置 %d 不得为负（毫米）", i+1, pos)
+		if pos < MinPositionMm || pos > MaxPositionMm {
+			return fmt.Errorf("第 %d 轴位置 %d 超出允许范围 %d-%d 毫米",
+				i+1, pos, MinPositionMm, MaxPositionMm)
 		}
 		if i > 0 && pos <= in.AxlePositionsMm[i-1] {
 			if pos == in.AxlePositionsMm[i-1] {

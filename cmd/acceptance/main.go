@@ -808,6 +808,47 @@ func main() {
 		return nil
 	})
 
+	// 极大轴位置与载荷：曾经溢出导致最大桥面载荷报零或少算，
+	// 现在必须统一 422 拒绝，只返回错误信封，不生成任何分析结果。
+	check("桥面窗口：极大轴位置与载荷返回 422 且无分析结果", func() error {
+		cases := []map[string]any{
+			{
+				"axle_positions_mm": []int{0, 1500, 9223372036854775807},
+				"axle_loads_kg":     []int{4000, 4000, 4000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  12000,
+			},
+			{
+				"axle_positions_mm": []int{0, 1500, 3000},
+				"axle_loads_kg":     []int{9223372036854775807, 4000, 4000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  12000,
+			},
+		}
+		for _, payload := range cases {
+			code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window", payload)
+			if err != nil {
+				return err
+			}
+			if code != http.StatusUnprocessableEntity {
+				return fmt.Errorf("期望 422，实际 %d，响应 %s", code, body)
+			}
+			var errResp struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+				return fmt.Errorf("422 响应缺少 error 字段: %s", body)
+			}
+			for _, kw := range []string{"max_load_kg", "first_axle", "last_axle",
+				"displacement_mm", "conclusion"} {
+				if bytes.Contains(body, []byte(kw)) {
+					return fmt.Errorf("422 响应夹带了分析结果（%s）: %s", kw, body)
+				}
+			}
+		}
+		return nil
+	})
+
 	if failures > 0 {
 		fmt.Printf("\n验收未通过：%d 项失败\n", failures)
 		os.Exit(1)
