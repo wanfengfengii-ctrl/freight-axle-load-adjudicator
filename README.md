@@ -210,6 +210,12 @@ curl -s -X POST localhost:8080/api/v1/verify \
 任一份数据非法（含未知字段、缺字段、数值越界、四轴组、地磅偏差超 5% 等）
 或两份轴数不一致时，**整体返回 HTTP 422**，错误信息明确指出是
 **“首次称重数据”还是“重测数据”**及具体原因，且**绝不夹带另一份裁决结果**。
+即使某一份数据在填写到一半时被截断（导致整个外层 JSON 不完整），错误仍会
+归因到当时正在读取的那一份，例如：
+
+```json
+{ "error": "重测数据不完整：JSON 在读取该字段时被截断，须提交包含 axle_loads_kg 与 axle_spacings_mm 的完整 JSON 对象" }
+```
 
 ```bash
 curl -s -X POST localhost:8080/api/v1/retest-comparison \

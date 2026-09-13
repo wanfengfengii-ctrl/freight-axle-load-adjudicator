@@ -425,6 +425,10 @@ func TestComparison_422Cases(t *testing.T) {
 	}{
 		{"空体", ``, ""},
 		{"顶层语法错误", `{"first":`, ""},
+		{"重测值中途截断", `{"first":` + valid + `,"retest":{"axle_loads_kg":[1,2]`, "重测"},
+		{"重测值内语法损坏", `{"first":` + valid + `,"retest":{"axle_loads_kg":[1,]}}`, "重测"},
+		{"重测值刚开始即截断", `{"first":` + valid + `,"retest":`, "重测"},
+		{"首次值中途截断", `{"first":{"axle_loads_kg":[1`, "首次"},
 		{"缺 first", `{"retest":` + valid + `}`, "first"},
 		{"缺 retest", `{"first":` + valid + `}`, "retest"},
 		{"first 为 null", `{"first":null,"retest":` + valid + `}`, "首次"},
@@ -440,6 +444,8 @@ func TestComparison_422Cases(t *testing.T) {
 		{"retest 轴距越界", `{"first":` + valid + `,"retest":{"axle_loads_kg":[1,1],"axle_spacings_mm":[10001]}}`, "重测"},
 		{"retest 四轴组非法", `{"first":` + valid + `,"retest":{"axle_loads_kg":[1,1,1,1],"axle_spacings_mm":[1800,1800,1800]}}`, "重测"},
 		{"轴数不一致", `{"first":{"axle_loads_kg":[1,2],"axle_spacings_mm":[1000]},"retest":{"axle_loads_kg":[1,2,3],"axle_spacings_mm":[1000,1000]}}`, "轴数不一致"},
+		{"first 重复键", `{"first":` + valid + `,"first":` + valid + `,"retest":` + valid + `}`, "重复"},
+		{"顶层不是对象", `[` + valid + `,` + valid + `]`, ""},
 		{"两个 JSON 文档", `{"first":` + valid + `,"retest":` + valid + `}{}`, ""},
 	}
 	for _, tc := range cases {
@@ -459,6 +465,60 @@ func TestComparison_422Cases(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 重测数据填写到一半被截断：错误必须明确指出是重测数据不完整，
+// 而不是笼统地报整个请求体不完整；首次截断同理归因首次。
+func TestComparison_TruncatedMeasurementNamesTheSide(t *testing.T) {
+	r := newRouter(t)
+	validFirst := `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}`
+	cases := []struct {
+		name           string
+		body           string
+		side           string
+		wantIncomplete bool
+	}{
+		{
+			"重测对象中途截断",
+			`{"first":` + validFirst + `,"retest":{"axle_loads_kg":[1,2]`,
+			"重测", true,
+		},
+		{
+			"重测值刚开始即截断",
+			`{"first":` + validFirst + `,"retest":`,
+			"重测", true,
+		},
+		{
+			"重测值内部语法损坏",
+			`{"first":` + validFirst + `,"retest":{"axle_loads_kg":[1,]}}`,
+			"重测", false,
+		},
+		{
+			"首次对象中途截断",
+			`{"first":{"axle_loads_kg":[1`,
+			"首次", true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, raw := doCompare(t, r, tc.body)
+			assert.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+			out := mustJSONMap(t, raw)
+			errMsg, _ := out["error"].(string)
+			assert.Contains(t, errMsg, tc.side)
+			if tc.wantIncomplete {
+				assert.Contains(t, errMsg, "不完整", "截断类错误应明确说明数据不完整: %s", errMsg)
+			}
+			assert.NotContains(t, string(raw), "first_result")
+			assert.NotContains(t, string(raw), "retest_result")
+		})
+	}
+
+	// 顶层结构在任何一份数据之前截断：无法归因到具体某一份，报整体不完整。
+	code, raw := doCompare(t, r, `{"firs`)
+	require.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+	out := mustJSONMap(t, raw)
+	assert.Contains(t, out["error"], "JSON 不完整")
 }
 
 // 第二份非法时不得有任何部分结果：即便 first 合法可裁决，也只返回错误。

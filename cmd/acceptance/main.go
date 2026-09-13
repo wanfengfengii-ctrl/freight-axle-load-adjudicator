@@ -555,6 +555,40 @@ func main() {
 		return nil
 	})
 
+	// 重测数据填写到一半被截断（外层 JSON 也因此不完整）：仍须明确指出是
+	// “重测数据”不完整，而不是笼统报整个请求体不完整，且不夹带任何结果。
+	check("重测比对：重测数据截断时错误归因到重测", func() error {
+		raw := []byte(`{"first":{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]},` +
+			`"retest":{"axle_loads_kg":[1,2]`)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+			base+"/api/v1/retest-comparison", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			return fmt.Errorf("期望 422，实际 %d，响应 %s", resp.StatusCode, body)
+		}
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+			return fmt.Errorf("422 响应缺少 error 字段: %s", body)
+		}
+		if !bytes.Contains(body, []byte("重测")) || !bytes.Contains(body, []byte("不完整")) {
+			return fmt.Errorf("截断错误应明确指出重测数据不完整，实际 %q", errResp.Error)
+		}
+		for _, kw := range []string{"first_result", "retest_result", "conclusion"} {
+			if bytes.Contains(body, []byte(kw)) {
+				return fmt.Errorf("422 响应夹带了部分结果（%s）: %s", kw, body)
+			}
+		}
+		return nil
+	})
+
 	// 轴数不一致同样整体 422；未知字段在顶层与任一份数据内均被拒绝。
 	check("重测比对：轴数不一致与未知字段返回 422", func() error {
 		cases := []struct {

@@ -24,12 +24,11 @@ type verifyRequest struct {
 	ScaleWeightKg *int `json:"scale_weight_kg"`
 }
 
-// retestCompareRequest 为重测比对入口的请求：first 与 retest 各自携带一份
-// 与单次裁决完全相同的测量数据（轴载荷、轴距及可选地磅重量）。
-type retestCompareRequest struct {
-	First  json.RawMessage `json:"first"`
-	Retest json.RawMessage `json:"retest"`
-}
+// compareOuterFirstKey / compareOuterRetestKey 为重测比对顶层仅有的两个键。
+const (
+	compareOuterFirstKey  = "first"
+	compareOuterRetestKey = "retest"
+)
 
 type errorResponse struct {
 	Error string `json:"error"`
@@ -77,38 +76,19 @@ func handleVerify(c *gin.Context) {
 }
 
 func handleRetestComparison(c *gin.Context) {
-	// 顶层先解析为结构体以拒绝未知字段并强制 first/retest 两个键；
-	// 任一份数据非法或轴数不一致都整体 422，绝不夹带另一份裁决结果。
-	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes))
-	dec.DisallowUnknownFields()
-	var outer retestCompareRequest
-	if err := dec.Decode(&outer); err != nil {
-		respond422(c, describeCompareDecodeError(err))
-		return
-	}
-	var extra json.RawMessage
-	if err := dec.Decode(&extra); err != io.EOF {
-		if err == nil {
-			respond422(c, "请求体中存在多个 JSON 值，只允许一个 JSON 对象")
-			return
-		}
-		respond422(c, describeCompareDecodeError(err))
-		return
-	}
-	if outer.First == nil {
-		respond422(c, "缺少必填字段 first（首次称重数据，字段契约与单次裁决相同）")
-		return
-	}
-	if outer.Retest == nil {
-		respond422(c, "缺少必填字段 retest（重测数据，字段契约与单次裁决相同）")
-		return
-	}
-
-	firstReq, ok := decodeMeasurement(c, outer.First, "首次称重数据")
+	// 顶层用 token 方式逐层扫描（而非一次性解到结构体）：当某一份数据的值在
+	// 解码处失败时（典型如重测数据填写到一半被截断），可把错误精确归因到
+	// first 或 retest，而不是笼统地报整个请求体不完整。
+	firstRaw, retestRaw, ok := parseCompareOuter(c)
 	if !ok {
 		return
 	}
-	retestReq, ok := decodeMeasurement(c, outer.Retest, "重测数据")
+
+	firstReq, ok := decodeMeasurement(c, firstRaw, "首次称重数据")
+	if !ok {
+		return
+	}
+	retestReq, ok := decodeMeasurement(c, retestRaw, "重测数据")
 	if !ok {
 		return
 	}
@@ -130,6 +110,96 @@ func handleRetestComparison(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, comparison)
+}
+
+// parseCompareOuter 用 token 逐层扫描重测比对请求的顶层 JSON 对象，
+// 读取 first/retest 两个键各自对应的完整值。顶层必须恰好是单个对象，
+// 且只允许 first、retest 两个键、各出现一次；任一约束不满足都整体 422。
+// 关键效果：当某个键的值本身无法读完时（典型如重测数据填写到一半被截断，
+// 或值内部存在语法错误），错误能归因到 first 或 retest 对应的那一份数据，
+// 而不是笼统地报整个请求体不完整。
+func parseCompareOuter(c *gin.Context) (firstRaw, retestRaw []byte, ok bool) {
+	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes))
+
+	open, err := dec.Token()
+	if err != nil {
+		respond422(c, describeOuterDecodeError("", err))
+		return nil, nil, false
+	}
+	delim, isDelim := open.(json.Delim)
+	if !isDelim || delim != '{' {
+		respond422(c, "请求体必须为包含 first 与 retest 两份测量数据的 JSON 对象")
+		return nil, nil, false
+	}
+
+	values := make(map[string][]byte, 2)
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			respond422(c, describeOuterDecodeError("", err))
+			return nil, nil, false
+		}
+		key, isString := keyToken.(string)
+		if !isString {
+			respond422(c, "JSON 解析失败：顶层键必须为字符串")
+			return nil, nil, false
+		}
+		if key != compareOuterFirstKey && key != compareOuterRetestKey {
+			respond422(c, "JSON 解析失败：json: unknown field \""+key+"\"")
+			return nil, nil, false
+		}
+		if _, exists := values[key]; exists {
+			respond422(c, outerLabel(key)+"重复出现，first 与 retest 各只能出现一次")
+			return nil, nil, false
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			// 值截断、值内部语法错误等：发生在读哪一份数据上，就归因到哪一份。
+			respond422(c, describeOuterDecodeError(outerLabel(key), err))
+			return nil, nil, false
+		}
+		values[key] = raw
+	}
+
+	// 读取闭合花括号，捕获对象未闭合即被截断的情形。
+	closeTok, err := dec.Token()
+	if err != nil {
+		respond422(c, describeOuterDecodeError("", err))
+		return nil, nil, false
+	}
+	if closeDelim, isDelim := closeTok.(json.Delim); !isDelim || closeDelim != '}' {
+		respond422(c, "JSON 解析失败：顶层对象缺少闭合花括号")
+		return nil, nil, false
+	}
+
+	// 顶层必须恰好只有一个 JSON 值，再解码一次时合法请求只能得到 io.EOF。
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			respond422(c, "请求体中存在多个 JSON 值，只允许一个 JSON 对象")
+			return nil, nil, false
+		}
+		respond422(c, describeOuterDecodeError("", err))
+		return nil, nil, false
+	}
+
+	if _, exists := values[compareOuterFirstKey]; !exists {
+		respond422(c, "缺少必填字段 first（首次称重数据，字段契约与单次裁决相同）")
+		return nil, nil, false
+	}
+	if _, exists := values[compareOuterRetestKey]; !exists {
+		respond422(c, "缺少必填字段 retest（重测数据，字段契约与单次裁决相同）")
+		return nil, nil, false
+	}
+	return values[compareOuterFirstKey], values[compareOuterRetestKey], true
+}
+
+// outerLabel 返回顶层键对应的中文数据名称，用于错误归因。
+func outerLabel(key string) string {
+	if key == compareOuterRetestKey {
+		return "重测数据"
+	}
+	return "首次称重数据"
 }
 
 // decodeVerifyHandlerBody 读取并解析单次裁决请求：请求体大小受限、
@@ -217,17 +287,24 @@ func describeDecodeError(err error) string {
 	}
 }
 
-// describeCompareDecodeError 描述重测比对请求顶层（first/retest 外层）的解码错误。
-func describeCompareDecodeError(err error) string {
-	switch {
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-		return "请求体为空或 JSON 不完整，须提交包含 first 与 retest 两份测量数据的 JSON 对象"
-	case errors.As(err, new(*json.UnmarshalTypeError)):
-		return "字段类型错误：first 与 retest 必须各自为一个 JSON 对象"
-	default:
-		// 含语法错误、未知字段等。
-		return "JSON 解析失败：" + err.Error()
+// describeOuterDecodeError 描述重测比对请求顶层扫描时的解码错误。
+// label 非空（首次称重数据/重测数据）表示失败发生在读取该键的值时
+// （典型为重测数据填写到一半被截断），错误须明确指出是哪一份数据不完整；
+// label 为空表示失败发生在外层结构本身，无法归因到具体某一份。
+func describeOuterDecodeError(label string, err error) string {
+	incomplete := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	if label != "" {
+		if incomplete {
+			return label + "不完整：JSON 在读取该字段时被截断，" +
+				"须提交包含 axle_loads_kg 与 axle_spacings_mm 的完整 JSON 对象"
+		}
+		return label + "的 JSON 解析失败：" + err.Error()
 	}
+	if incomplete {
+		return "请求体为空或 JSON 不完整，须提交包含 first 与 retest 两份测量数据的 JSON 对象"
+	}
+	// 含语法错误等。
+	return "JSON 解析失败：" + err.Error()
 }
 
 // describeMeasurementDecodeError 与 describeDecodeError 同义，但为重测比对中的
