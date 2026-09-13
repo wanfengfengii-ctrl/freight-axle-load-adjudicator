@@ -91,11 +91,7 @@ func TestBridgeWindow_422Cases(t *testing.T) {
 		{"位置未递增", `{"axle_positions_mm":[0,3000,1500],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"位置为负", `{"axle_positions_mm":[-1,1500,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"载荷为零", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,0,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
-		{"载荷超上限", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,20001,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
-		{"载荷极大", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[9223372036854775807,1,1],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"载荷超int64", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[9223372036854775808,1,1],"bridge_length_mm":3000,"approved_load_kg":12000}`},
-		{"位置超上限", `{"axle_positions_mm":[0,1500,100001],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
-		{"位置极大", `{"axle_positions_mm":[0,1500,9223372036854775807],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"位置超int64", `{"axle_positions_mm":[0,1500,9223372036854775808],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"桥长低于下限", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":999,"approved_load_kg":12000}`},
 		{"桥长高于上限", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":50001,"approved_load_kg":12000}`},
@@ -177,4 +173,32 @@ func TestBridgeWindow_UnknownFieldMessage(t *testing.T) {
 	require.Equal(t, http.StatusUnprocessableEntity, code)
 	out := mustJSONMap(t, raw)
 	assert.Contains(t, out["error"], "unknown field")
+}
+
+// 极大轴位置与载荷不设上限、不得溢出：三轴各 math.MaxInt64 时峰值
+// 3×9223372036854775807 = 27670116110564327421，须作为 JSON 数字精确返回，
+// 不得报成零或少算；响应字节一并锁定。
+func TestBridgeWindow_ExtremeLoadsExactJSONNumber(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1500,3000],`+
+			`"axle_loads_kg":[9223372036854775807,9223372036854775807,9223372036854775807],`+
+			`"bridge_length_mm":3000,"approved_load_kg":200000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":27670116110564327421,"first_axle":1,"last_axle":3,"displacement_mm":3000,"conclusion":"拦停"}`,
+		string(raw))
+}
+
+// 极大轴位置：后轴离开位移（进入位移+桥长）超出 int64 仍精确计算，
+// 两轴不会同时落桥，峰值为车头轴单轴载荷。
+func TestBridgeWindow_ExtremePositionsExact(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,9223372036854775807],"axle_loads_kg":[4000,5000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":12000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":5000,"first_axle":2,"last_axle":2,"displacement_mm":0,"conclusion":"通行"}`,
+		string(raw))
 }

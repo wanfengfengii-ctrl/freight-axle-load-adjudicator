@@ -3,7 +3,8 @@
 // （两次一致确认、载荷翻转、轴距重排、第二份非法无部分结果）检查，
 // 并校验 JSON 请求契约（非 JSON 媒体类型拒绝、字段名大小写变体按未知字段拒绝），
 // 再以三轴车辆验收桥面承载窗口分析（边界恰好容纳前后轴计入载荷、平移后峰值
-// 触发拦停、并列峰值选择最早事件、位置重复只返回错误信封），
+// 触发拦停、并列峰值选择最早事件、位置重复只返回错误信封、极大轴位置与载荷
+// 精确计算不溢出），
 // 全部通过才以 0 退出。
 package main
 
@@ -725,7 +726,7 @@ func main() {
 				"bridge_length_mm":  3000,
 				"approved_load_kg":  12000,
 			},
-			bridgeWindowWant{maxLoadKg: 12000, firstAxle: 1, lastAxle: 3,
+			bridgeWindowWant{maxLoadKg: "12000", firstAxle: 1, lastAxle: 3,
 				displacementMm: 3000, conclusion: "通行"})
 	})
 
@@ -738,7 +739,7 @@ func main() {
 				"bridge_length_mm":  3000,
 				"approved_load_kg":  11999,
 			},
-			bridgeWindowWant{maxLoadKg: 12000, firstAxle: 1, lastAxle: 3,
+			bridgeWindowWant{maxLoadKg: "12000", firstAxle: 1, lastAxle: 3,
 				displacementMm: 3000, conclusion: "拦停"})
 	})
 
@@ -752,7 +753,7 @@ func main() {
 				"bridge_length_mm":  2000,
 				"approved_load_kg":  8000,
 			},
-			bridgeWindowWant{maxLoadKg: 8000, firstAxle: 2, lastAxle: 3,
+			bridgeWindowWant{maxLoadKg: "8000", firstAxle: 2, lastAxle: 3,
 				displacementMm: 2000, conclusion: "通行"})
 	})
 
@@ -808,43 +809,32 @@ func main() {
 		return nil
 	})
 
-	// 极大轴位置与载荷：曾经溢出导致最大桥面载荷报零或少算，
-	// 现在必须统一 422 拒绝，只返回错误信封，不生成任何分析结果。
-	check("桥面窗口：极大轴位置与载荷返回 422 且无分析结果", func() error {
-		cases := []map[string]any{
-			{
-				"axle_positions_mm": []int{0, 1500, 9223372036854775807},
-				"axle_loads_kg":     []int{4000, 4000, 4000},
-				"bridge_length_mm":  3000,
-				"approved_load_kg":  12000,
-			},
-			{
+	// 极大轴位置与载荷不设上限、不得溢出：极大载荷合计须作为 JSON 数字
+	// 精确返回（不得报成零或少算），极大位置下离开位移溢出仍须精确分析。
+	check("桥面窗口：极大轴位置与载荷精确计算不溢出", func() error {
+		// 三轴各 2^63-1：峰值 3×9223372036854775807 = 27670116110564327421。
+		if err := checkBridgeWindow(ctx, client, base,
+			map[string]any{
 				"axle_positions_mm": []int{0, 1500, 3000},
-				"axle_loads_kg":     []int{9223372036854775807, 4000, 4000},
+				"axle_loads_kg":     []int{9223372036854775807, 9223372036854775807, 9223372036854775807},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  200000,
+			},
+			bridgeWindowWant{maxLoadKg: "27670116110564327421", firstAxle: 1, lastAxle: 3,
+				displacementMm: 3000, conclusion: "拦停"}); err != nil {
+			return fmt.Errorf("极大载荷: %w", err)
+		}
+		// 后轴位置 2^63-1：其离开位移超出 int 范围，两轴不会同时落桥。
+		if err := checkBridgeWindow(ctx, client, base,
+			map[string]any{
+				"axle_positions_mm": []int{0, 9223372036854775807},
+				"axle_loads_kg":     []int{4000, 5000},
 				"bridge_length_mm":  3000,
 				"approved_load_kg":  12000,
 			},
-		}
-		for _, payload := range cases {
-			code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window", payload)
-			if err != nil {
-				return err
-			}
-			if code != http.StatusUnprocessableEntity {
-				return fmt.Errorf("期望 422，实际 %d，响应 %s", code, body)
-			}
-			var errResp struct {
-				Error string `json:"error"`
-			}
-			if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
-				return fmt.Errorf("422 响应缺少 error 字段: %s", body)
-			}
-			for _, kw := range []string{"max_load_kg", "first_axle", "last_axle",
-				"displacement_mm", "conclusion"} {
-				if bytes.Contains(body, []byte(kw)) {
-					return fmt.Errorf("422 响应夹带了分析结果（%s）: %s", kw, body)
-				}
-			}
+			bridgeWindowWant{maxLoadKg: "5000", firstAxle: 2, lastAxle: 2,
+				displacementMm: 0, conclusion: "通行"}); err != nil {
+			return fmt.Errorf("极大位置: %w", err)
 		}
 		return nil
 	})
@@ -856,9 +846,10 @@ func main() {
 	fmt.Println("\n全部验收项通过")
 }
 
-// bridgeWindowWant 为桥面承载窗口分析验收的期望值。
+// bridgeWindowWant 为桥面承载窗口分析验收的期望值。最大载荷按十进制字符串
+// 比较：极大载荷合计可能超出 int64，须按任意精度精确校验。
 type bridgeWindowWant struct {
-	maxLoadKg      int
+	maxLoadKg      string
 	firstAxle      int
 	lastAxle       int
 	displacementMm int
@@ -876,16 +867,16 @@ func checkBridgeWindow(ctx context.Context, client *http.Client, base string,
 		return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
 	}
 	var got struct {
-		MaxLoadKg      int    `json:"max_load_kg"`
-		FirstAxle      int    `json:"first_axle"`
-		LastAxle       int    `json:"last_axle"`
-		DisplacementMm int    `json:"displacement_mm"`
-		Conclusion     string `json:"conclusion"`
+		MaxLoadKg      json.Number `json:"max_load_kg"`
+		FirstAxle      int         `json:"first_axle"`
+		LastAxle       int         `json:"last_axle"`
+		DisplacementMm int         `json:"displacement_mm"`
+		Conclusion     string      `json:"conclusion"`
 	}
 	if err := json.Unmarshal(body, &got); err != nil {
 		return err
 	}
-	if got.MaxLoadKg != want.maxLoadKg || got.FirstAxle != want.firstAxle ||
+	if got.MaxLoadKg.String() != want.maxLoadKg || got.FirstAxle != want.firstAxle ||
 		got.LastAxle != want.lastAxle || got.DisplacementMm != want.displacementMm ||
 		got.Conclusion != want.conclusion {
 		return fmt.Errorf("分析结果不符: 期望 %+v，实际 %+v", want, got)

@@ -23,13 +23,14 @@ type bridgeRequest struct {
 }
 
 // bridgeResponse 为桥面承载窗口分析成功响应：最大桥面载荷、对应首尾轴
-// 序号、发生位移与通行或拦停结论。
+// 序号、发生位移与通行或拦停结论。最大桥面载荷按任意精度整数输出
+// （json.Number 序列化为 JSON 数字，极大载荷不会溢出成零或变小）。
 type bridgeResponse struct {
-	MaxLoadKg      int    `json:"max_load_kg"`
-	FirstAxle      int    `json:"first_axle"`
-	LastAxle       int    `json:"last_axle"`
-	DisplacementMm int    `json:"displacement_mm"`
-	Conclusion     string `json:"conclusion"`
+	MaxLoadKg      json.Number `json:"max_load_kg"`
+	FirstAxle      int         `json:"first_axle"`
+	LastAxle       int         `json:"last_axle"`
+	DisplacementMm int         `json:"displacement_mm"`
+	Conclusion     string      `json:"conclusion"`
 }
 
 // 桥面承载窗口分析明确约定的字段名；其它任何拼写（含大小写变体）都视为未知字段。
@@ -62,7 +63,7 @@ func handleBridgeWindow(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, bridgeResponse{
-		MaxLoadKg:      analysis.MaxLoadKg,
+		MaxLoadKg:      json.Number(analysis.MaxLoadKg.String()),
 		FirstAxle:      analysis.FirstAxle,
 		LastAxle:       analysis.LastAxle,
 		DisplacementMm: analysis.DisplacementMm,

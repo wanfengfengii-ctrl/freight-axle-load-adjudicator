@@ -8,79 +8,83 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// assertAnalysis 校验一次分析结果：最大载荷按字符串比较（任意精度），
+// 其余字段逐项相等。
+func assertAnalysis(t *testing.T, wantMaxLoadKg string, wantFirst, wantLast, wantDisplacement int,
+	wantConclusion string, got *Analysis) {
+	t.Helper()
+	require.NotNil(t, got)
+	assert.Equal(t, wantMaxLoadKg, got.MaxLoadKg.String(), "最大桥面载荷")
+	assert.Equal(t, wantFirst, got.FirstAxle, "首轴序号")
+	assert.Equal(t, wantLast, got.LastAxle, "尾轴序号")
+	assert.Equal(t, wantDisplacement, got.DisplacementMm, "发生位移")
+	assert.Equal(t, wantConclusion, got.Conclusion, "结论")
+}
+
+// windowView 为 Window 的可比较视图（载荷转十进制字符串）。
+type windowView struct {
+	first, last, displacement int
+	load                      string
+}
+
+func views(windows []Window) []windowView {
+	out := make([]windowView, len(windows))
+	for i, w := range windows {
+		out[i] = windowView{w.FirstAxle, w.LastAxle, w.DisplacementMm, w.LoadKg.String()}
+	}
+	return out
+}
+
 // 三轴车、桥面有效长度恰好等于首尾轴距：平移至车头轴抵达桥出口、
 // 车尾轴抵达桥入口的瞬间（位移 3000），边界上的前后轴均计入载荷，
 // 三轴合计 12000 达到峰值。
 func TestAnalyze_BoundaryExactFitCountsEdgeAxles(t *testing.T) {
-	in := Input{
+	got, err := Analyze(Input{
 		AxlePositionsMm: []int{0, 1500, 3000},
 		AxleLoadsKg:     []int{4000, 4000, 4000},
 		BridgeLengthMm:  3000,
 		ApprovedLoadKg:  12000,
-	}
-	got, err := Analyze(in)
+	})
 	require.NoError(t, err)
-	assert.Equal(t, &Analysis{
-		MaxLoadKg:      12000,
-		FirstAxle:      1,
-		LastAxle:       3,
-		DisplacementMm: 3000,
-		Conclusion:     ConclusionPass, // 等于核定载荷判定为通行
-	}, got)
+	// 等于核定载荷判定为通行。
+	assertAnalysis(t, "12000", 1, 3, 3000, ConclusionPass, got)
 }
 
 // 同一车辆、核定载荷低于峰值 1 千克：平移后出现的峰值触发拦停。
 func TestAnalyze_PeakAfterTranslationStops(t *testing.T) {
-	in := Input{
+	got, err := Analyze(Input{
 		AxlePositionsMm: []int{0, 1500, 3000},
 		AxleLoadsKg:     []int{4000, 4000, 4000},
 		BridgeLengthMm:  3000,
 		ApprovedLoadKg:  11999,
-	}
-	got, err := Analyze(in)
+	})
 	require.NoError(t, err)
-	assert.Equal(t, 12000, got.MaxLoadKg)
-	assert.Equal(t, 3000, got.DisplacementMm, "峰值出现在平移之后")
-	assert.Equal(t, ConclusionStop, got.Conclusion)
+	assertAnalysis(t, "12000", 1, 3, 3000, ConclusionStop, got)
 }
 
 // 并列峰值：{2,3} 轴在位移 2000、{1,2} 轴在位移 4000 都达到 8000，
 // 按车辆位移最小确定唯一结果（首轴序号更大的候选反而落选，可锁定裁决次序）。
 func TestAnalyze_TiedPeaksChooseEarliestDisplacement(t *testing.T) {
-	in := Input{
+	got, err := Analyze(Input{
 		AxlePositionsMm: []int{0, 2000, 4000},
 		AxleLoadsKg:     []int{5000, 3000, 5000},
 		BridgeLengthMm:  2000,
 		ApprovedLoadKg:  8000,
-	}
-	got, err := Analyze(in)
+	})
 	require.NoError(t, err)
-	assert.Equal(t, &Analysis{
-		MaxLoadKg:      8000,
-		FirstAxle:      2,
-		LastAxle:       3,
-		DisplacementMm: 2000,
-		Conclusion:     ConclusionPass,
-	}, got)
+	assertAnalysis(t, "8000", 2, 3, 2000, ConclusionPass, got)
 }
 
 // 相邻轴距大于桥长：两轴不会同时落桥，峰值为较重的单轴。
 func TestAnalyze_GapLargerThanBridgeNeverShares(t *testing.T) {
-	in := Input{
+	got, err := Analyze(Input{
 		AxlePositionsMm: []int{0, 6000},
 		AxleLoadsKg:     []int{3000, 5000},
 		BridgeLengthMm:  3000,
 		ApprovedLoadKg:  10000,
-	}
-	got, err := Analyze(in)
+	})
 	require.NoError(t, err)
-	assert.Equal(t, &Analysis{
-		MaxLoadKg:      5000,
-		FirstAxle:      2,
-		LastAxle:       2,
-		DisplacementMm: 0,
-		Conclusion:     ConclusionPass,
-	}, got)
+	assertAnalysis(t, "5000", 2, 2, 0, ConclusionPass, got)
 }
 
 // 单轴车：进入即峰值，位移为 0。
@@ -92,13 +96,7 @@ func TestAnalyze_SingleAxle(t *testing.T) {
 		ApprovedLoadKg:  9000,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, &Analysis{
-		MaxLoadKg:      9000,
-		FirstAxle:      1,
-		LastAxle:       1,
-		DisplacementMm: 0,
-		Conclusion:     ConclusionPass,
-	}, got)
+	assertAnalysis(t, "9000", 1, 1, 0, ConclusionPass, got)
 
 	// 同一单轴车，核定载荷差 1 千克即拦停。
 	got, err = Analyze(Input{
@@ -121,13 +119,7 @@ func TestAnalyze_WholeVehicleOnBridge(t *testing.T) {
 		ApprovedLoadKg:  6000,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, &Analysis{
-		MaxLoadKg:      6000,
-		FirstAxle:      1,
-		LastAxle:       3,
-		DisplacementMm: 2000,
-		Conclusion:     ConclusionPass,
-	}, got)
+	assertAnalysis(t, "6000", 1, 3, 2000, ConclusionPass, got)
 }
 
 // 锁定边界恰好容纳场景的事件扫描序列：同位移处进入先于离开，
@@ -139,13 +131,13 @@ func TestScanWindows_EnterBeforeLeaveAtSameDisplacement(t *testing.T) {
 		BridgeLengthMm:  3000,
 		ApprovedLoadKg:  12000,
 	})
-	require.Equal(t, []Window{
-		{FirstAxle: 3, LastAxle: 3, DisplacementMm: 0, LoadKg: 4000},
-		{FirstAxle: 2, LastAxle: 3, DisplacementMm: 1500, LoadKg: 8000},
-		{FirstAxle: 1, LastAxle: 3, DisplacementMm: 3000, LoadKg: 12000},
-		{FirstAxle: 1, LastAxle: 2, DisplacementMm: 3000, LoadKg: 8000},
-		{FirstAxle: 1, LastAxle: 1, DisplacementMm: 4500, LoadKg: 4000},
-	}, windows)
+	require.Equal(t, []windowView{
+		{3, 3, 0, "4000"},
+		{2, 3, 1500, "8000"},
+		{1, 3, 3000, "12000"},
+		{1, 2, 3000, "8000"},
+		{1, 1, 4500, "4000"},
+	}, views(windows))
 }
 
 // 轴距大于桥长时落桥区间会出现空档：空档不产出区间，事件扫描仍完整。
@@ -156,10 +148,10 @@ func TestScanWindows_EmptyGapProducesNoWindow(t *testing.T) {
 		BridgeLengthMm:  3000,
 		ApprovedLoadKg:  10000,
 	})
-	require.Equal(t, []Window{
-		{FirstAxle: 2, LastAxle: 2, DisplacementMm: 0, LoadKg: 5000},
-		{FirstAxle: 1, LastAxle: 1, DisplacementMm: 6000, LoadKg: 3000},
-	}, windows)
+	require.Equal(t, []windowView{
+		{2, 2, 0, "5000"},
+		{1, 1, 6000, "3000"},
+	}, views(windows))
 }
 
 // 相同输入两次分析，结果完全一致（唯一确定结论）。
@@ -174,7 +166,97 @@ func TestAnalyze_Deterministic(t *testing.T) {
 	require.NoError(t, err)
 	second, err := Analyze(in)
 	require.NoError(t, err)
+	assert.Equal(t, first.MaxLoadKg.String(), second.MaxLoadKg.String())
 	assert.Equal(t, first, second)
+}
+
+// 极大数值不再被拒绝，也不允许溢出：极大轴位置曾使“进入位移+桥长”回绕成
+// 负位移、极大载荷曾使求和回绕，导致最大桥面载荷被报成零或少算。
+// 现在这类合法输入必须得到精确结果。
+func TestAnalyze_ExtremeValuesExact(t *testing.T) {
+	t.Run("极大轴位置：离开位移溢出仍精确", func(t *testing.T) {
+		// 首尾轴跨度接近 int 上限：后轴的离开位移（进入位移+桥长）超出 int 范围。
+		// 两轴不会同时落桥，峰值为车头轴单轴 4000，位移 0。
+		got, err := Analyze(Input{
+			AxlePositionsMm: []int{0, math.MaxInt64},
+			AxleLoadsKg:     []int{4000, 4000},
+			BridgeLengthMm:  3000,
+			ApprovedLoadKg:  12000,
+		})
+		require.NoError(t, err)
+		assertAnalysis(t, "4000", 2, 2, 0, ConclusionPass, got)
+	})
+
+	t.Run("极大载荷：三轴合计超出 int64 仍精确", func(t *testing.T) {
+		// 边界恰好容纳场景，三轴各 math.MaxInt64：
+		// 峰值 3×9223372036854775807 = 27670116110564327421，不得回绕。
+		got, err := Analyze(Input{
+			AxlePositionsMm: []int{0, 1500, 3000},
+			AxleLoadsKg:     []int{math.MaxInt64, math.MaxInt64, math.MaxInt64},
+			BridgeLengthMm:  3000,
+			ApprovedLoadKg:  200000,
+		})
+		require.NoError(t, err)
+		assertAnalysis(t, "27670116110564327421", 1, 3, 3000, ConclusionStop, got)
+	})
+
+	t.Run("极大位置与载荷混合", func(t *testing.T) {
+		// 位置贴近 int 上限但跨度仅 1 毫米：位移很小，载荷合计
+		// math.MaxInt64+1 = 9223372036854775808 超出 int64，须精确。
+		got, err := Analyze(Input{
+			AxlePositionsMm: []int{math.MaxInt64 - 1, math.MaxInt64},
+			AxleLoadsKg:     []int{math.MaxInt64, 1},
+			BridgeLengthMm:  50000,
+			ApprovedLoadKg:  200000,
+		})
+		require.NoError(t, err)
+		assertAnalysis(t, "9223372036854775808", 1, 2, 1, ConclusionStop, got)
+	})
+
+	t.Run("双轴极大载荷合计", func(t *testing.T) {
+		// 2×math.MaxInt64 = 18446744073709551614（= 2^64-2），int64 装不下。
+		got, err := Analyze(Input{
+			AxlePositionsMm: []int{math.MaxInt64 - 10, math.MaxInt64},
+			AxleLoadsKg:     []int{math.MaxInt64, math.MaxInt64},
+			BridgeLengthMm:  50000,
+			ApprovedLoadKg:  200000,
+		})
+		require.NoError(t, err)
+		assertAnalysis(t, "18446744073709551614", 1, 2, 10, ConclusionStop, got)
+	})
+}
+
+// 极大载荷下并列峰值的裁决次序仍然稳定：{2,3} 轴与 {1,2} 轴的合计同为
+// math.MaxInt64+1，选择位移更小者。
+func TestAnalyze_ExtremeValuesTieBreakStable(t *testing.T) {
+	got, err := Analyze(Input{
+		AxlePositionsMm: []int{0, 2000, 4000},
+		AxleLoadsKg:     []int{math.MaxInt64, 1, math.MaxInt64},
+		BridgeLengthMm:  2000,
+		ApprovedLoadKg:  200000,
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "9223372036854775808", 2, 3, 2000, ConclusionStop, got)
+}
+
+// 12 轴重车：全部整数运算在极大载荷下仍精确，落桥 6 轴合计
+// 6×math.MaxInt64 = 55340232221128654842。
+func TestAnalyze_MaximumVehicleComputesExactly(t *testing.T) {
+	positions := make([]int, 0, MaxAxles)
+	loads := make([]int, 0, MaxAxles)
+	for i := 0; i < MaxAxles; i++ {
+		positions = append(positions, i*9000) // 末轴位置 99000
+		loads = append(loads, math.MaxInt64)
+	}
+	got, err := Analyze(Input{
+		AxlePositionsMm: positions,
+		AxleLoadsKg:     loads,
+		BridgeLengthMm:  MaxBridgeLengthMm,
+		ApprovedLoadKg:  MaxApprovedLoadKg,
+	})
+	require.NoError(t, err)
+	// 桥长 50000 可容纳连续 6 轴（跨度 45000）。
+	assertAnalysis(t, "55340232221128654842", 7, 12, 45000, ConclusionStop, got)
 }
 
 func TestValidate_Errors(t *testing.T) {
@@ -199,11 +281,7 @@ func TestValidate_Errors(t *testing.T) {
 		{"位置项数与轴数不一致", func(in *Input) { in.AxlePositionsMm = []int{0, 1500} }, "一致"},
 		{"载荷为零", func(in *Input) { in.AxleLoadsKg[1] = 0 }, "载荷"},
 		{"载荷为负", func(in *Input) { in.AxleLoadsKg[0] = -100 }, "载荷"},
-		{"载荷超上限", func(in *Input) { in.AxleLoadsKg[2] = 20001 }, "载荷"},
-		{"载荷极大", func(in *Input) { in.AxleLoadsKg[0] = math.MaxInt64 }, "载荷"},
-		{"位置为负", func(in *Input) { in.AxlePositionsMm[0] = -1 }, "超出允许范围"},
-		{"位置超上限", func(in *Input) { in.AxlePositionsMm[2] = 100001 }, "超出允许范围"},
-		{"位置极大", func(in *Input) { in.AxlePositionsMm[2] = math.MaxInt64 }, "超出允许范围"},
+		{"位置为负", func(in *Input) { in.AxlePositionsMm[0] = -1 }, "不得为负"},
 		{"位置重复", func(in *Input) { in.AxlePositionsMm = []int{0, 1500, 1500} }, "重复"},
 		{"位置未递增", func(in *Input) { in.AxlePositionsMm = []int{0, 3000, 1500} }, "严格递增"},
 		{"桥长低于下限", func(in *Input) { in.BridgeLengthMm = 999 }, "桥面有效长度"},
@@ -227,72 +305,54 @@ func TestValidate_Errors(t *testing.T) {
 	}
 }
 
-// 边界值合法：桥长 1000/50000、核定载荷 1/200000、载荷 20000、位置 0/100000
-// 均须通过校验。
+// 边界值合法：桥长 1000/50000、核定载荷 1/200000、位置 0 均须通过校验；
+// 轴位置与轴载荷不设上限，极大数值同样合法。
 func TestValidate_BoundaryValuesAccepted(t *testing.T) {
 	for _, in := range []Input{
 		{AxlePositionsMm: []int{0}, AxleLoadsKg: []int{1}, BridgeLengthMm: 1000, ApprovedLoadKg: 1},
 		{AxlePositionsMm: []int{0}, AxleLoadsKg: []int{1}, BridgeLengthMm: 50000, ApprovedLoadKg: 200000},
 		{AxlePositionsMm: []int{0, 49000}, AxleLoadsKg: []int{1, 1}, BridgeLengthMm: 1000, ApprovedLoadKg: 1},
 		{AxlePositionsMm: []int{0, 100000}, AxleLoadsKg: []int{20000, 20000}, BridgeLengthMm: 50000, ApprovedLoadKg: 40000},
+		{AxlePositionsMm: []int{0, math.MaxInt64}, AxleLoadsKg: []int{math.MaxInt64, 1}, BridgeLengthMm: 1000, ApprovedLoadKg: 1},
 	} {
 		assert.NoError(t, Validate(in), "%+v", in)
 	}
 }
 
-// 溢出回归：极大轴位置曾使“进入位移+桥长”回绕成负位移、极大载荷曾使求和
-// 回绕，导致最大桥面载荷被报成零或少算。现在这类输入一律被校验拒绝，
-// 绝不产出错误分析结果。
-func TestAnalyze_ExtremeValuesRejectedNoOverflow(t *testing.T) {
-	cases := []struct {
-		name string
-		in   Input
-	}{
-		{"极大轴位置", Input{
-			AxlePositionsMm: []int{0, math.MaxInt64},
-			AxleLoadsKg:     []int{4000, 4000},
-			BridgeLengthMm:  3000,
-			ApprovedLoadKg:  12000,
-		}},
-		{"极大轴载荷", Input{
-			AxlePositionsMm: []int{0, 1500},
-			AxleLoadsKg:     []int{math.MaxInt64, math.MaxInt64},
-			BridgeLengthMm:  3000,
-			ApprovedLoadKg:  200000,
-		}},
-		{"极大位置与载荷", Input{
-			AxlePositionsMm: []int{math.MaxInt64 - 1, math.MaxInt64},
-			AxleLoadsKg:     []int{math.MaxInt64, 1},
-			BridgeLengthMm:  50000,
-			ApprovedLoadKg:  200000,
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			res, err := Analyze(tc.in)
-			require.Error(t, err)
-			assert.Nil(t, res)
-		})
-	}
-}
-
-// 上限边界处的最重车辆：12 轴各 20000 千克、位置达 100000 毫米，
-// 全部整数运算不溢出，落桥载荷合计 240000 千克被正确算出。
-func TestAnalyze_MaximumVehicleComputesExactly(t *testing.T) {
-	positions := make([]int, 0, MaxAxles)
-	loads := make([]int, 0, MaxAxles)
-	for i := 0; i < MaxAxles; i++ {
-		positions = append(positions, i*9000) // 末轴位置 99000，贴上限
-		loads = append(loads, MaxAxleLoadKg)
-	}
+// 载荷合计为任意精度整数：与核定载荷的比较不受 int64 范围限制。
+func TestAnalyze_ApprovedComparisonExact(t *testing.T) {
 	got, err := Analyze(Input{
-		AxlePositionsMm: positions,
-		AxleLoadsKg:     loads,
-		BridgeLengthMm:  MaxBridgeLengthMm,
-		ApprovedLoadKg:  MaxApprovedLoadKg,
+		AxlePositionsMm: []int{0, 1500},
+		AxleLoadsKg:     []int{math.MaxInt64, 1},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  200000,
 	})
 	require.NoError(t, err)
-	// 桥长 50000 可容纳连续 6 轴（跨度 45000），峰值 6×20000=120000。
-	assert.Equal(t, 120000, got.MaxLoadKg)
-	assert.Equal(t, ConclusionPass, got.Conclusion)
+	assert.Equal(t, "9223372036854775808", got.MaxLoadKg.String())
+	assert.Equal(t, ConclusionStop, got.Conclusion)
+
+	// 核定载荷恰为上限 200000 时，单轴 200000 仍判定通行（等于不拦停）。
+	got, err = Analyze(Input{
+		AxlePositionsMm: []int{0},
+		AxleLoadsKg:     []int{200000},
+		BridgeLengthMm:  1000,
+		ApprovedLoadKg:  200000,
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "200000", 1, 1, 0, ConclusionPass, got)
+}
+
+// 防止 big.Int 在窗口间共享底层数组：先扫描出的区间载荷不得被后续事件改写。
+func TestScanWindows_LoadSnapshotsIndependent(t *testing.T) {
+	windows := ScanWindows(Input{
+		AxlePositionsMm: []int{0, 1500, 3000},
+		AxleLoadsKg:     []int{math.MaxInt64, 2, 3},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  12000,
+	})
+	require.Len(t, windows, 5)
+	// 第一个窗口（位移 0，仅车头轴，载荷 3）若被后续加减改写则不再是 3。
+	assert.Equal(t, "3", windows[0].LoadKg.String())
+	assert.Equal(t, "5", windows[1].LoadKg.String())
+	assert.Equal(t, "9223372036854775812", windows[2].LoadKg.String()) // MaxInt64+2+3
 }
