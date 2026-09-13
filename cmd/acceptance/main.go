@@ -4,7 +4,9 @@
 // 并校验 JSON 请求契约（非 JSON 媒体类型拒绝、字段名大小写变体按未知字段拒绝），
 // 再以三轴车辆验收桥面承载窗口分析（边界恰好容纳前后轴计入载荷、平移后峰值
 // 触发拦停、并列峰值选择最早事件、位置重复只返回错误信封、极大轴位置与载荷
-// 精确计算不溢出），
+// 精确计算不溢出）；桥面窗口携带预计车速时，验收持续超载区段载荷与向上取整
+// 时长、载荷变化时不同恒定载荷区段不合并、同位移进出的瞬时超载只影响原峰值
+// 且累计时长为零，以及省略车速时既有响应字节不变，
 // 全部通过才以 0 退出。
 package main
 
@@ -839,6 +841,215 @@ func main() {
 		return nil
 	})
 
+	// 携带预计车速、持续超载：响应在原峰值字段后追加超载区段与累计时长，
+	// 区段载荷恒定、毫秒数按“位移差乘 1000 除以车速”向上取整。
+	check("桥面窗口：车速下持续超载给出区段载荷与向上取整时长", func() error {
+		baseReq := map[string]any{
+			"axle_positions_mm": []int{0, 1000, 2000},
+			"axle_loads_kg":     []int{4000, 4000, 4000},
+			"bridge_length_mm":  3000,
+			"approved_load_kg":  11999,
+		}
+		// 车速 1000mm/s：三轴全落桥区间 [2000,3000) 载荷 12000，长度 1000mm，1000ms。
+		req := cloneMap(baseReq)
+		req["speed_mm_per_s"] = 1000
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window", req)
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		want := `{"max_load_kg":12000,"first_axle":1,"last_axle":3,"displacement_mm":2000,` +
+			`"conclusion":"拦停","overload_segments":[` +
+			`{"start_displacement_mm":2000,"end_displacement_mm":3000,"load_kg":12000,"duration_ms":1000}` +
+			`],"total_overload_duration_ms":1000}`
+		if string(body) != want {
+			return fmt.Errorf("车速响应字节不符:\n期望 %s\n实际 %s", want, body)
+		}
+
+		// 向上取整：同段长度 1000mm，车速 3000mm/s -> ceil(1000000/3000)=334ms。
+		req = cloneMap(baseReq)
+		req["speed_mm_per_s"] = 3000
+		_, body, err = postJSON(ctx, client, base+"/api/v1/bridge-window", req)
+		if err != nil {
+			return err
+		}
+		var got struct {
+			Segments []struct {
+				StartDisplacementMm json.Number `json:"start_displacement_mm"`
+				EndDisplacementMm   json.Number `json:"end_displacement_mm"`
+				LoadKg              json.Number `json:"load_kg"`
+				DurationMs          json.Number `json:"duration_ms"`
+			} `json:"overload_segments"`
+			TotalMs json.Number `json:"total_overload_duration_ms"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		if len(got.Segments) != 1 || got.Segments[0].DurationMs.String() != "334" ||
+			got.Segments[0].LoadKg.String() != "12000" || got.TotalMs.String() != "334" {
+			return fmt.Errorf("向上取整结果不符: %s", body)
+		}
+		return nil
+	})
+
+	// 载荷变化：8000、12000、8000 三个不同恒定载荷区段被中间区段隔开，
+	// 两个 8000 区段不相邻，不得合并为一段。
+	check("桥面窗口：载荷变化时不同恒定载荷区段不合并", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1000, 2000},
+				"axle_loads_kg":     []int{4000, 4000, 4000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  7000,
+				"speed_mm_per_s":    1000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			Segments []struct {
+				Start int `json:"start_displacement_mm"`
+				End   int `json:"end_displacement_mm"`
+				Load  int `json:"load_kg"`
+				Ms    int `json:"duration_ms"`
+			} `json:"overload_segments"`
+			TotalMs int `json:"total_overload_duration_ms"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		want := []struct{ start, end, load, ms int }{
+			{1000, 2000, 8000, 1000},
+			{2000, 3000, 12000, 1000},
+			{3000, 4000, 8000, 1000},
+		}
+		if len(got.Segments) != len(want) {
+			return fmt.Errorf("期望 %d 段，实际 %d: %s", len(want), len(got.Segments), body)
+		}
+		for i, w := range want {
+			g := got.Segments[i]
+			if g.Start != w.start || g.End != w.end || g.Load != w.load || g.Ms != w.ms {
+				return fmt.Errorf("第 %d 段不符：期望 %+v，实际 %+v", i+1, w, g)
+			}
+		}
+		if got.TotalMs != 3000 {
+			return fmt.Errorf("累计时长期望 3000，实际 %d", got.TotalMs)
+		}
+		return nil
+	})
+
+	// 同位移进出：仅在进入后、离开前的瞬时峰值 15000 超载，任何正长度区间的
+	// 载荷都不超过核定值 12000。瞬时峰值照常给出拦停结论，但区段为空、
+	// 累计时长为零。
+	check("桥面窗口：同位移瞬时超载只影响原峰值且累计为零", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1500, 3000},
+				"axle_loads_kg":     []int{4000, 4000, 7000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  12000,
+				"speed_mm_per_s":    1000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		want := `{"max_load_kg":15000,"first_axle":1,"last_axle":3,"displacement_mm":3000,` +
+			`"conclusion":"拦停","overload_segments":[],"total_overload_duration_ms":0}`
+		if string(body) != want {
+			return fmt.Errorf("瞬时超载响应不符:\n期望 %s\n实际 %s", want, body)
+		}
+		return nil
+	})
+
+	// 省略车速（或显式 null）时执行既有分析，成功响应与引入车速能力前
+	// 逐字节一致，不出现车速产物字段。
+	check("桥面窗口：省略车速的既有响应字节不变", func() error {
+		want := `{"max_load_kg":12000,"first_axle":1,"last_axle":3,"displacement_mm":3000,"conclusion":"通行"}`
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1500, 3000},
+				"axle_loads_kg":     []int{4000, 4000, 4000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  12000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK || string(body) != want {
+			return fmt.Errorf("省略车速响应发生变化：期望 %s，实际 %d %s", want, code, body)
+		}
+		if bytes.Contains(body, []byte("overload_segments")) ||
+			bytes.Contains(body, []byte("total_overload_duration_ms")) {
+			return fmt.Errorf("省略车速响应不得包含车速产物: %s", body)
+		}
+		// 显式 null 与省略等价（map 无法表达 null，直接发原始 JSON）。
+		raw := []byte(`{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],` +
+			`"bridge_length_mm":3000,"approved_load_kg":12000,"speed_mm_per_s":null}`)
+		httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+			base+"/api/v1/bridge-window", bytes.NewReader(raw))
+		httpReq.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return err
+		}
+		nullBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || string(nullBody) != want {
+			return fmt.Errorf("车速为 null 响应发生变化：期望 %s，实际 %d %s", want, resp.StatusCode, nullBody)
+		}
+		return nil
+	})
+
+	// 车速字段类型错误、为零或越界：统一 422，错误信封之外不附带任何分析结果。
+	check("桥面窗口：车速非法时 422 且无分析结果", func() error {
+		cases := []struct {
+			name string
+			raw  string
+		}{
+			{"车速为零", `"speed_mm_per_s":0`},
+			{"车速越界", `"speed_mm_per_s":50001`},
+			{"车速为字符串", `"speed_mm_per_s":"1000"`},
+			{"车速为小数", `"speed_mm_per_s":1000.5`},
+		}
+		for _, tc := range cases {
+			raw := []byte(`{"axle_positions_mm":[0,1000],"axle_loads_kg":[4000,4000],` +
+				`"bridge_length_mm":3000,"approved_load_kg":12000,` + tc.raw + `}`)
+			httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+				base+"/api/v1/bridge-window", bytes.NewReader(raw))
+			httpReq.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(httpReq)
+			if err != nil {
+				return fmt.Errorf("%s: %w", tc.name, err)
+			}
+			badBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnprocessableEntity {
+				return fmt.Errorf("%s 期望 422，实际 %d，响应 %s", tc.name, resp.StatusCode, badBody)
+			}
+			var errResp struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(badBody, &errResp); err != nil || errResp.Error == "" {
+				return fmt.Errorf("%s 的 422 响应缺少 error: %s", tc.name, badBody)
+			}
+			for _, kw := range []string{"max_load_kg", "conclusion", "overload_segments",
+				"total_overload_duration_ms"} {
+				if bytes.Contains(badBody, []byte(kw)) {
+					return fmt.Errorf("%s 的 422 夹带了分析结果（%s）: %s", tc.name, kw, badBody)
+				}
+			}
+		}
+		return nil
+	})
+
 	if failures > 0 {
 		fmt.Printf("\n验收未通过：%d 项失败\n", failures)
 		os.Exit(1)
@@ -932,4 +1143,14 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// cloneMap 复制一份请求 map，便于在同一份基础请求上设置不同的选填字段
+// （如车速）而不污染原 map。
+func cloneMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
