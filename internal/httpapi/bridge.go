@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -17,12 +20,16 @@ import (
 // 载荷与轴一一对应，桥长与核定载荷为现场核定值。前四个字段必填；
 // SpeedMmPerS 选填：预计车速（毫米每秒），缺省或 null 时只执行既有峰值分析，
 // 提供时额外返回超载区段与累计时长。
+//
+// 轴位置与轴载荷按任意精度整数（*big.Int）解码：契约只设下限不设上限，
+// 超出 int64 的极大数值须原样保留并精确分析；切片元素为 nil 只可能来自
+// 数组中的 null，由必填/逐项校验拒绝，绝不静默当作零。
 type bridgeRequest struct {
-	AxlePositionsMm []int `json:"axle_positions_mm"`
-	AxleLoadsKg     []int `json:"axle_loads_kg"`
-	BridgeLengthMm  *int  `json:"bridge_length_mm"`
-	ApprovedLoadKg  *int  `json:"approved_load_kg"`
-	SpeedMmPerS     *int  `json:"speed_mm_per_s"`
+	AxlePositionsMm []*big.Int `json:"axle_positions_mm"`
+	AxleLoadsKg     []*big.Int `json:"axle_loads_kg"`
+	BridgeLengthMm  *int       `json:"bridge_length_mm"`
+	ApprovedLoadKg  *int       `json:"approved_load_kg"`
+	SpeedMmPerS     *int       `json:"speed_mm_per_s"`
 }
 
 // bridgeSegmentJSON 为单个超载区段的响应项：起止位移、该段恒定载荷与
@@ -36,8 +43,8 @@ type bridgeSegmentJSON struct {
 }
 
 // bridgeResponse 为桥面承载窗口分析成功响应：最大桥面载荷、对应首尾轴
-// 序号、发生位移与通行或拦停结论。最大桥面载荷按任意精度整数输出
-// （json.Number 序列化为 JSON 数字，极大载荷不会溢出成零或变小）。
+// 序号、发生位移与通行或拦停结论。最大桥面载荷与发生位移按任意精度整数
+// 输出（json.Number 序列化为 JSON 数字，极大载荷或位移不会溢出成零或变小）。
 // 提供预计车速时嵌入 bridgeSpeedExtras（字段平铺在末尾）；缺省时该指针为
 // nil，omitempty 使两个车速字段连同键名一律不出现，响应与引入车速能力前
 // 逐字节一致。
@@ -45,7 +52,7 @@ type bridgeResponse struct {
 	MaxLoadKg      json.Number `json:"max_load_kg"`
 	FirstAxle      int         `json:"first_axle"`
 	LastAxle       int         `json:"last_axle"`
-	DisplacementMm int         `json:"displacement_mm"`
+	DisplacementMm json.Number `json:"displacement_mm"`
 	Conclusion     string      `json:"conclusion"`
 
 	*bridgeSpeedExtras
@@ -93,7 +100,7 @@ func handleBridgeWindow(c *gin.Context) {
 		MaxLoadKg:      json.Number(analysis.MaxLoadKg.String()),
 		FirstAxle:      analysis.FirstAxle,
 		LastAxle:       analysis.LastAxle,
-		DisplacementMm: analysis.DisplacementMm,
+		DisplacementMm: json.Number(analysis.DisplacementMm.String()),
 		Conclusion:     analysis.Conclusion,
 	}
 	// 仅在提供预计车速时追加超载区段与累计时长；缺省或 null 时 extras 为
@@ -152,8 +159,16 @@ func decodeBridgeBody(c *gin.Context) (*bridgeRequest, bool) {
 		respond422(c, "缺少必填字段 axle_positions_mm（按车头方向严格递增的轴位置，毫米）")
 		return nil, false
 	}
+	if i := firstNullElement(req.AxlePositionsMm); i >= 0 {
+		respond422(c, fmtNonNullElement("axle_positions_mm", i, "轴位置", "毫米"))
+		return nil, false
+	}
 	if req.AxleLoadsKg == nil {
 		respond422(c, "缺少必填字段 axle_loads_kg（与轴位置一一对应的轴载荷，千克）")
+		return nil, false
+	}
+	if i := firstNullElement(req.AxleLoadsKg); i >= 0 {
+		respond422(c, fmtNonNullElement("axle_loads_kg", i, "轴载荷", "千克"))
 		return nil, false
 	}
 	if req.BridgeLengthMm == nil {
@@ -174,11 +189,33 @@ func describeBridgeDecodeError(err error) string {
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		return "请求体为空或 JSON 不完整，须提交包含 axle_positions_mm、axle_loads_kg、" +
 			"bridge_length_mm 与 approved_load_kg 的 JSON 对象"
-	case errors.As(err, new(*json.UnmarshalTypeError)):
-		return "字段类型错误：axle_positions_mm 与 axle_loads_kg 必须为整数数组，" +
+	case errors.As(err, new(*json.UnmarshalTypeError)),
+		strings.Contains(err.Error(), "math/big: cannot unmarshal"):
+		// 数组元素按任意精度 *big.Int 解码：小数、字符串、布尔等非整数元素由
+		// math/big 报错（而非 UnmarshalTypeError），统一归入“字段类型错误”文案。
+		return "字段类型错误：axle_positions_mm 与 axle_loads_kg 必须为整数数组（元素不得为 null），" +
 			"bridge_length_mm、approved_load_kg 与选填 speed_mm_per_s 必须为整数"
 	default:
-		// 含语法错误、未知字段、数字写入整型失败（如 1.5、超大数）等。
+		// 含语法错误、未知字段等。
 		return "JSON 解析失败：" + err.Error()
 	}
+}
+
+// firstNullElement 返回整数数组中第一个 null 元素的下标（0 基），没有则返回 -1。
+// 解码目标为 []*big.Int 时，数组中的 null 会被静默置为 nil；契约要求逐项为
+// 非空整数，故在此显式拦下，避免把缺项误当作 0 毫米或 0 千克完成分析。
+func firstNullElement(values []*big.Int) int {
+	for i, v := range values {
+		if v == nil {
+			return i
+		}
+	}
+	return -1
+}
+
+// fmtNonNullElement 给出数组元素为 null 时的 422 文案：field 为契约字段名，
+// index 为 0 基下标，kind/unit 用于指出是轴位置还是轴载荷及其单位。
+func fmtNonNullElement(field string, index int, kind, unit string) string {
+	return fmt.Sprintf("字段类型错误：%s 的第 %d 项为 null，%s必须逐项为非空整数（%s），不允许 null",
+		field, index+1, kind, unit)
 }

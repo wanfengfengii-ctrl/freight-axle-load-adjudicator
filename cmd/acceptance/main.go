@@ -729,7 +729,7 @@ func main() {
 				"approved_load_kg":  12000,
 			},
 			bridgeWindowWant{maxLoadKg: "12000", firstAxle: 1, lastAxle: 3,
-				displacementMm: 3000, conclusion: "通行"})
+				displacementMm: "3000", conclusion: "通行"})
 	})
 
 	// 同一车辆、核定载荷低于峰值 1 千克：平移后出现的峰值触发拦停。
@@ -742,7 +742,7 @@ func main() {
 				"approved_load_kg":  11999,
 			},
 			bridgeWindowWant{maxLoadKg: "12000", firstAxle: 1, lastAxle: 3,
-				displacementMm: 3000, conclusion: "拦停"})
+				displacementMm: "3000", conclusion: "拦停"})
 	})
 
 	// 并列峰值：{2,3} 轴在位移 2000、{1,2} 轴在位移 4000 同为 8000，
@@ -756,7 +756,7 @@ func main() {
 				"approved_load_kg":  8000,
 			},
 			bridgeWindowWant{maxLoadKg: "8000", firstAxle: 2, lastAxle: 3,
-				displacementMm: 2000, conclusion: "通行"})
+				displacementMm: "2000", conclusion: "通行"})
 	})
 
 	// 位置重复：统一 422，只返回错误信封，不生成任何分析结果。
@@ -823,7 +823,7 @@ func main() {
 				"approved_load_kg":  200000,
 			},
 			bridgeWindowWant{maxLoadKg: "27670116110564327421", firstAxle: 1, lastAxle: 3,
-				displacementMm: 3000, conclusion: "拦停"}); err != nil {
+				displacementMm: "3000", conclusion: "拦停"}); err != nil {
 			return fmt.Errorf("极大载荷: %w", err)
 		}
 		// 后轴位置 2^63-1：其离开位移超出 int 范围，两轴不会同时落桥。
@@ -835,14 +835,101 @@ func main() {
 				"approved_load_kg":  12000,
 			},
 			bridgeWindowWant{maxLoadKg: "5000", firstAxle: 2, lastAxle: 2,
-				displacementMm: 0, conclusion: "通行"}); err != nil {
+				displacementMm: "0", conclusion: "通行"}); err != nil {
 			return fmt.Errorf("极大位置: %w", err)
 		}
 		return nil
 	})
 
-	// 携带预计车速、持续超载：响应在原峰值字段后追加超载区段与累计时长，
-	// 区段载荷恒定、毫秒数按“位移差乘 1000 除以车速”向上取整。
+	// 值守员在单轴桥面请求的位置数组中误填 null：不得把它当作 0 毫米完成
+	// 分析，必须统一 422 拒绝非整数位置，且只返回错误信封、不夹带分析结果。
+	check("桥面窗口：位置数组中的 null 被拒绝而不是当作零", func() error {
+		raw := []byte(`{"axle_positions_mm":[null],"axle_loads_kg":[4000],` +
+			`"bridge_length_mm":3000,"approved_load_kg":12000}`)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/bridge-window",
+			bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			return fmt.Errorf("期望 422，实际 %d，响应 %s", resp.StatusCode, body)
+		}
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+			return fmt.Errorf("422 响应缺少 error: %s", body)
+		}
+		if !bytes.Contains(body, []byte("axle_positions_mm")) ||
+			!bytes.Contains(body, []byte("null")) {
+			return fmt.Errorf("错误应点名位置字段的 null 元素，实际 %q", errResp.Error)
+		}
+		for _, kw := range []string{"max_load_kg", "first_axle", "last_axle",
+			"displacement_mm", "conclusion"} {
+			if bytes.Contains(body, []byte(kw)) {
+				return fmt.Errorf("422 响应夹带了分析结果（%s）: %s", kw, body)
+			}
+		}
+
+		// 多轴请求中某个位置元素误填 null 同样拒绝；载荷数组中的 null 亦然。
+		for _, tc := range []struct {
+			name string
+			raw  string
+		}{
+			{"位置中间元素为 null", `{"axle_positions_mm":[0,null,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
+			{"载荷元素为 null", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,null,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
+		} {
+			httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/bridge-window",
+				bytes.NewReader([]byte(tc.raw)))
+			httpReq.Header.Set("Content-Type", "application/json")
+			resp2, err := client.Do(httpReq)
+			if err != nil {
+				return fmt.Errorf("%s: %w", tc.name, err)
+			}
+			bad, _ := io.ReadAll(io.LimitReader(resp2.Body, 1<<20))
+			resp2.Body.Close()
+			if resp2.StatusCode != http.StatusUnprocessableEntity {
+				return fmt.Errorf("%s 期望 422，实际 %d，响应 %s", tc.name, resp2.StatusCode, bad)
+			}
+		}
+		return nil
+	})
+
+	// 轴位置契约不设上限：位置超出平台整数上限（2^63-1）时也必须精确完成
+	// 桥面分析，而不是直接解析失败。此时取得峰值的车辆位移同样超出 int64，
+	// displacement_mm 须作为精确 JSON 数字返回（不溢出成零或负数）。
+	check("桥面窗口：位置超出整数上限仍精确分析", func() error {
+		raw := `{"axle_positions_mm":[0,1500,9223372036854775808],` +
+			`"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`
+		// 车头轴（2^63）进入后随即离开，不与后两轴共用桥面；车尾两轴在
+		// 位移 2^63 时一度同桥，峰值 8000，峰值位移即 2^63。
+		return checkBridgeWindowRaw(ctx, client, base, raw,
+			bridgeWindowWant{maxLoadKg: "8000", firstAxle: 1, lastAxle: 2,
+				displacementMm: "9223372036854775808", conclusion: "通行"})
+	})
+
+	// 轴载荷契约不设上限：载荷超出平台整数上限（2^63-1）时必须在任意精度
+	// 求和后返回精确峰值与拦停结论，而不是在求和前拒绝。
+	check("桥面窗口：载荷超出整数上限仍精确求和给结论", func() error {
+		raw := `{"axle_positions_mm":[0],"axle_loads_kg":[9223372036854775808],` +
+			`"bridge_length_mm":3000,"approved_load_kg":200000}`
+		if err := checkBridgeWindowRaw(ctx, client, base, raw,
+			bridgeWindowWant{maxLoadKg: "9223372036854775808", firstAxle: 1, lastAxle: 1,
+				displacementMm: "0", conclusion: "拦停"}); err != nil {
+			return err
+		}
+		// 多轴任意精度求和：2^63 + 1 + 1 = 9223372036854775810。
+		raw = `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[9223372036854775808,1,1],` +
+			`"bridge_length_mm":3000,"approved_load_kg":200000}`
+		return checkBridgeWindowRaw(ctx, client, base, raw,
+			bridgeWindowWant{maxLoadKg: "9223372036854775810", firstAxle: 1, lastAxle: 3,
+				displacementMm: "3000", conclusion: "拦停"})
+	})
+
 	check("桥面窗口：车速下持续超载给出区段载荷与向上取整时长", func() error {
 		baseReq := map[string]any{
 			"axle_positions_mm": []int{0, 1000, 2000},
@@ -1057,13 +1144,14 @@ func main() {
 	fmt.Println("\n全部验收项通过")
 }
 
-// bridgeWindowWant 为桥面承载窗口分析验收的期望值。最大载荷按十进制字符串
-// 比较：极大载荷合计可能超出 int64，须按任意精度精确校验。
+// bridgeWindowWant 为桥面承载窗口分析验收的期望值。最大载荷与发生位移按
+// 十进制字符串比较：极大载荷合计或峰值位移可能超出 int64，须按任意精度
+// 精确校验。
 type bridgeWindowWant struct {
 	maxLoadKg      string
 	firstAxle      int
 	lastAxle       int
-	displacementMm int
+	displacementMm string
 	conclusion     string
 }
 
@@ -1081,14 +1169,51 @@ func checkBridgeWindow(ctx context.Context, client *http.Client, base string,
 		MaxLoadKg      json.Number `json:"max_load_kg"`
 		FirstAxle      int         `json:"first_axle"`
 		LastAxle       int         `json:"last_axle"`
-		DisplacementMm int         `json:"displacement_mm"`
+		DisplacementMm json.Number `json:"displacement_mm"`
 		Conclusion     string      `json:"conclusion"`
 	}
 	if err := json.Unmarshal(body, &got); err != nil {
 		return err
 	}
 	if got.MaxLoadKg.String() != want.maxLoadKg || got.FirstAxle != want.firstAxle ||
-		got.LastAxle != want.lastAxle || got.DisplacementMm != want.displacementMm ||
+		got.LastAxle != want.lastAxle || got.DisplacementMm.String() != want.displacementMm ||
+		got.Conclusion != want.conclusion {
+		return fmt.Errorf("分析结果不符: 期望 %+v，实际 %+v", want, got)
+	}
+	return nil
+}
+
+// checkBridgeWindowRaw 以原始 JSON 提交桥面承载窗口分析，用于 Go 整型字面量
+// 无法表达的超出 int64 的合法数值；按任意精度字符串校验峰值与发生位移。
+func checkBridgeWindowRaw(ctx context.Context, client *http.Client, base, rawBody string,
+	want bridgeWindowWant) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/bridge-window",
+		bytes.NewReader([]byte(rawBody)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("期望 200，实际 %d，响应 %s", resp.StatusCode, body)
+	}
+	var got struct {
+		MaxLoadKg      json.Number `json:"max_load_kg"`
+		FirstAxle      int         `json:"first_axle"`
+		LastAxle       int         `json:"last_axle"`
+		DisplacementMm json.Number `json:"displacement_mm"`
+		Conclusion     string      `json:"conclusion"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		return err
+	}
+	if got.MaxLoadKg.String() != want.maxLoadKg || got.FirstAxle != want.firstAxle ||
+		got.LastAxle != want.lastAxle || got.DisplacementMm.String() != want.displacementMm ||
 		got.Conclusion != want.conclusion {
 		return fmt.Errorf("分析结果不符: 期望 %+v，实际 %+v", want, got)
 	}

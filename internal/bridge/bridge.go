@@ -2,14 +2,13 @@
 // 扫描各轴进入与离开有效桥面的事件，求任一时刻落在有效桥面的轴载合计最大值，
 // 并给出通行或拦停结论。本包为独立领域逻辑，不调用轴组裁决与重测比对。
 //
-// 轴位置与轴载荷只设下限（位置非负、载荷为正），不设上限：落桥载荷按任意精度
-// 整数求和，离开事件位移的排序对超出 int 范围的情形做了保序处理，极大数值
-// 不会溢出，最大桥面载荷不会被报成零或少算。
+// 轴位置与轴载荷只设下限（位置非负、载荷为正），不设上限：二者连同事件位移、
+// 落桥载荷合计全部按任意精度整数（big.Int）运算与排序，超出 int64 范围的
+// 极大数值不会溢出，最大桥面载荷不会被报成零或少算。
 package bridge
 
 import (
 	"fmt"
-	"math"
 	"math/big"
 	"sort"
 )
@@ -39,12 +38,16 @@ const (
 // Input 为一次桥面承载窗口分析的输入：轴位置按车头方向严格递增（车尾轴在前、
 // 车头轴在后），载荷与轴一一对应，桥长为桥面有效长度，核定载荷为现场核定值。
 //
+// 轴位置与轴载荷均为任意精度整数（math/big.Int）：只设下限不设上限，
+// 超出 int64 的极大数值同样合法并被精确分析；切片元素不得为 nil
+// （nil 表示该项缺失或提交为 null，由 Validate 拒绝）。
+//
 // SpeedMmPerS 选填：车辆匀速通过桥面的预计车速（毫米每秒）。缺省（nil）时
 // 只执行既有峰值分析，结果与引入车速能力前逐字段一致；提供时额外生成超载
 // 区段与累计时长。车速约束为 MinSpeedMmPerS～MaxSpeedMmPerS（均含）。
 type Input struct {
-	AxlePositionsMm []int
-	AxleLoadsKg     []int
+	AxlePositionsMm []*big.Int
+	AxleLoadsKg     []*big.Int
 	BridgeLengthMm  int
 	ApprovedLoadKg  int
 	SpeedMmPerS     *int
@@ -52,11 +55,11 @@ type Input struct {
 
 // Window 为领域对象“连续落桥轴区间”：车辆平移过程中，落在有效桥面的轴始终
 // 构成一段连续区间，本结构记录该区间形成时的首尾轴序号（1 基，按提交顺序）、
-// 当时的车辆位移与落桥轴载合计（任意精度整数，极大载荷不溢出）。
+// 当时的车辆位移与落桥轴载合计（位移与载荷均为任意精度整数，极大数值不溢出）。
 type Window struct {
 	FirstAxle      int
 	LastAxle       int
-	DisplacementMm int
+	DisplacementMm *big.Int
 	LoadKg         *big.Int
 }
 
@@ -70,7 +73,7 @@ type Analysis struct {
 	MaxLoadKg      *big.Int // 最大桥面载荷，任意精度整数，千克
 	FirstAxle      int      // 取得最大值时的首轴序号（1 基）
 	LastAxle       int      // 取得最大值时的尾轴序号（1 基）
-	DisplacementMm int      // 取得最大值时的车辆位移，毫米
+	DisplacementMm *big.Int // 取得最大值时的车辆位移，任意精度整数，毫米
 	Conclusion     string   // ConclusionPass 或 ConclusionStop
 
 	// OverloadSegments 为位移长度大于零且恒定载荷超过核定载荷的区段，按起始
@@ -105,22 +108,30 @@ func Validate(in Input) error {
 			n, n, len(in.AxlePositionsMm))
 	}
 	for i, load := range in.AxleLoadsKg {
-		if load < MinAxleLoadKg {
-			return fmt.Errorf("第 %d 轴载荷 %d 必须不小于 %d 千克",
-				i+1, load, MinAxleLoadKg)
+		if load == nil {
+			return fmt.Errorf("第 %d 轴载荷缺失：轴载荷必须逐项为非空整数（千克），不允许 null", i+1)
+		}
+		if load.Cmp(big.NewInt(MinAxleLoadKg)) < 0 {
+			return fmt.Errorf("第 %d 轴载荷 %s 必须不小于 %d 千克",
+				i+1, load.String(), MinAxleLoadKg)
 		}
 	}
 	for i, pos := range in.AxlePositionsMm {
-		if pos < MinPositionMm {
-			return fmt.Errorf("第 %d 轴位置 %d 不得为负（毫米）", i+1, pos)
+		if pos == nil {
+			return fmt.Errorf("第 %d 轴位置缺失：轴位置必须逐项为非空整数（毫米），不允许 null", i+1)
 		}
-		if i > 0 && pos <= in.AxlePositionsMm[i-1] {
-			if pos == in.AxlePositionsMm[i-1] {
-				return fmt.Errorf("第 %d 轴与第 %d 轴位置重复（均为 %d 毫米），轴位置不得重复",
-					i, i+1, pos)
+		if pos.Cmp(big.NewInt(MinPositionMm)) < 0 {
+			return fmt.Errorf("第 %d 轴位置 %s 不得为负（毫米）", i+1, pos.String())
+		}
+		if i > 0 {
+			switch pos.Cmp(in.AxlePositionsMm[i-1]) {
+			case 0:
+				return fmt.Errorf("第 %d 轴与第 %d 轴位置重复（均为 %s 毫米），轴位置不得重复",
+					i, i+1, pos.String())
+			case -1:
+				return fmt.Errorf("轴位置须按车头方向严格递增：第 %d 轴位置 %s 不大于第 %d 轴位置 %s（毫米）",
+					i+1, pos.String(), i, in.AxlePositionsMm[i-1].String())
 			}
-			return fmt.Errorf("轴位置须按车头方向严格递增：第 %d 轴位置 %d 不大于第 %d 轴位置 %d（毫米）",
-				i+1, pos, i, in.AxlePositionsMm[i-1])
 		}
 	}
 	if in.BridgeLengthMm < MinBridgeLengthMm || in.BridgeLengthMm > MaxBridgeLengthMm {
@@ -214,7 +225,7 @@ func OverloadSegments(in Input) ([]OverloadSegment, *big.Int) {
 			open = nil
 		}
 	}
-	for _, group := range eventGroups(events, in.BridgeLengthMm) {
+	for _, group := range eventGroups(events) {
 		if prevD != nil && group.d.Cmp(prevD) > 0 && !prevEmpty {
 			// 区间 [prevD, group.d) 内无事件，载荷恒为 prevLoad。
 			if prevLoad.Cmp(approved) > 0 {
@@ -240,8 +251,8 @@ func OverloadSegments(in Input) ([]OverloadSegment, *big.Int) {
 	return segments, total
 }
 
-// eventGroup 为同一位移处全部事件处理完毕后的状态：精确位移（可能超出 int
-// 范围）、桥面载荷以及区间是否为空。
+// eventGroup 为同一位移处全部事件处理完毕后的状态：精确位移（任意精度，
+// 可超出 int64 范围）、桥面载荷以及区间是否为空。
 type eventGroup struct {
 	d     *big.Int
 	load  *big.Int
@@ -249,34 +260,32 @@ type eventGroup struct {
 }
 
 // eventGroups 按排好序的事件流把同一位移处的事件归为一组（进入先于离开），
-// 逐组累计载荷并给出每组之后的桥面状态；离开位移超出 int 范围时按
-// “进入位移 + 桥长”以任意精度整数精确给出。
-func eventGroups(events []axleEvent, bridgeLengthMm int) []eventGroup {
+// 逐组累计载荷并给出每组之后的桥面状态。事件位移本身已是任意精度整数，
+// 超出 int64 的离开位移（进入位移 + 桥长）在此被原样保留、精确分组。
+func eventGroups(events []axleEvent) []eventGroup {
 	groups := make([]eventGroup, 0, len(events))
 	load := new(big.Int)
 	onBridge := 0
 	for i := 0; i < len(events); {
-		d := eventDisplacement(events[i], bridgeLengthMm)
+		d := events[i].displacementMm
 		j := i + 1
 		for j < len(events) {
-			dj := eventDisplacement(events[j], bridgeLengthMm)
-			if dj.Cmp(d) != 0 {
+			if events[j].displacementMm.Cmp(d) != 0 {
 				break
 			}
 			j++
 		}
 		for _, ev := range events[i:j] {
-			weight := big.NewInt(int64(ev.axleLoadKg))
 			if ev.enter {
-				load.Add(load, weight)
+				load.Add(load, ev.axleLoadKg)
 				onBridge++
 			} else {
-				load.Sub(load, weight)
+				load.Sub(load, ev.axleLoadKg)
 				onBridge--
 			}
 		}
 		groups = append(groups, eventGroup{
-			d:     d,
+			d:     new(big.Int).Set(d),
 			load:  new(big.Int).Set(load),
 			empty: onBridge == 0,
 		})
@@ -285,62 +294,45 @@ func eventGroups(events []axleEvent, bridgeLengthMm int) []eventGroup {
 	return groups
 }
 
-// eventDisplacement 给出事件的精确位移：溢出 int 的离开事件按
-// “进入位移 + 桥长”以任意精度整数给出，极大车辆跨度不丢精度。
-func eventDisplacement(ev axleEvent, bridgeLengthMm int) *big.Int {
-	d := big.NewInt(int64(ev.displacementMm))
-	if ev.beyondInt {
-		d.Add(d, big.NewInt(int64(bridgeLengthMm)))
-	}
-	return d
-}
-
 // axleEvent 为一根轴进入或离开有效桥面的事件。
 type axleEvent struct {
-	displacementMm int  // 事件发生时的车辆位移，毫米（可表示时）
-	axle           int  // 轴下标（0 基，按提交顺序）
-	axleLoadKg     int  // 该轴载荷，千克，分组累计时使用
-	enter          bool // true 进入、false 离开
-	// beyondInt 仅用于离开事件：离开位移 = 进入位移 + 桥长 超出 int 范围时
-	// 为 true，此时 displacementMm 存进入位移。数学上该离开位移大于任何
-	// 可表示位移，排序时置于全部可表示事件之后；溢出的离开事件之间按
-	// 进入位移排序（同加桥长不改变相对次序），全程无需计算溢出值。
-	beyondInt bool
+	displacementMm *big.Int // 事件发生时的车辆位移，毫米（任意精度整数）
+	axle           int      // 轴下标（0 基，按提交顺序）
+	axleLoadKg     *big.Int // 该轴载荷，千克，分组累计时使用
+	enter          bool     // true 进入、false 离开
 }
 
 // buildEvents 生成并排序车辆平移过程中的全部进入、离开事件：同一位移处进入
-// 事件先于离开事件处理（边界闭区间上的两根轴一并计入）；离开位移超出 int
-// 范围的事件保序置于最后，不计算溢出值。调用前必须完成 Validate。
+// 事件先于离开事件处理（边界闭区间上的两根轴一并计入载荷）。进入位移为
+// “车头轴位置 − 本轴位置”，离开位移为“进入位移 + 桥长”，全程任意精度整数
+// 运算，极大车辆跨度下离开位移超出 int64 也直接参与比较与排序，不回绕、
+// 不丢精度。调用前必须完成 Validate。
 func buildEvents(in Input) []axleEvent {
 	n := len(in.AxlePositionsMm)
 	head := in.AxlePositionsMm[n-1] // 车头轴位置（最大）
+	bridgeLength := big.NewInt(int64(in.BridgeLengthMm))
 	events := make([]axleEvent, 0, 2*n)
 	for i, pos := range in.AxlePositionsMm {
-		enter := head - pos // 轴 i 抵达桥入口时的车辆位移；head >= pos，不会下溢
+		enter := new(big.Int).Sub(head, pos) // 轴 i 抵达桥入口时的车辆位移；head >= pos，不会为负
 		events = append(events, axleEvent{
-			displacementMm: enter,
+			displacementMm: new(big.Int).Set(enter),
 			axle:           i,
 			axleLoadKg:     in.AxleLoadsKg[i],
 			enter:          true,
 		})
-		leave := axleEvent{axle: i, axleLoadKg: in.AxleLoadsKg[i]}
-		if enter <= math.MaxInt-in.BridgeLengthMm {
-			leave.displacementMm = enter + in.BridgeLengthMm
-		} else {
-			leave.displacementMm = enter
-			leave.beyondInt = true
-		}
-		events = append(events, leave)
+		events = append(events, axleEvent{
+			displacementMm: new(big.Int).Add(enter, bridgeLength),
+			axle:           i,
+			axleLoadKg:     in.AxleLoadsKg[i],
+			enter:          false,
+		})
 	}
 	// 同一位移处进入事件先于离开事件处理：前轴恰抵桥出口、后轴恰抵桥入口的
 	// 瞬间，两根边界轴都落在闭区间桥面上，须在同一时刻一并计入载荷。
 	sort.Slice(events, func(a, b int) bool {
 		x, y := events[a], events[b]
-		if x.beyondInt != y.beyondInt {
-			return !x.beyondInt // 可表示事件在前，溢出离开事件排在最后
-		}
-		if x.displacementMm != y.displacementMm {
-			return x.displacementMm < y.displacementMm
+		if c := x.displacementMm.Cmp(y.displacementMm); c != 0 {
+			return c < 0
 		}
 		return x.enter && !y.enter
 	})
@@ -353,7 +345,7 @@ func buildEvents(in Input) []axleEvent {
 // 位移原点为车头轴抵达桥入口（桥面坐标 0）的时刻，此后车辆每前进 1 毫米
 // 位移加 1；轴 i 的桥面坐标 = 位移 − (车头轴位置 − 轴 i 位置)，坐标落在
 // [0, 桥长] 闭区间内即视为落桥——桥面边界恰好容纳的轴（坐标 0 或桥长处）
-// 同样计入载荷。调用前必须完成 Validate。
+// 同样计入载荷。位移与载荷均按任意精度整数给出。调用前必须完成 Validate。
 func ScanWindows(in Input) []Window {
 	n := len(in.AxlePositionsMm)
 	events := buildEvents(in)
@@ -367,25 +359,18 @@ func ScanWindows(in Input) []Window {
 	for _, ev := range events {
 		if ev.enter {
 			first = ev.axle
-			load.Add(load, big.NewInt(int64(ev.axleLoadKg)))
+			load.Add(load, ev.axleLoadKg)
 		} else {
 			last = ev.axle - 1
-			load.Sub(load, big.NewInt(int64(ev.axleLoadKg)))
+			load.Sub(load, ev.axleLoadKg)
 		}
 		if first > last {
 			continue // 空区间不产出
 		}
-		if ev.beyondInt {
-			// 位移超出 int 范围的离开事件不产出快照：所有进入事件都排在它
-			// 之前，此后只剩离开事件，区间载荷严格单调下降，被跳过区间的
-			// 载荷必小于收缩前已记录的状态，不可能成为峰值；其位移本身也
-			// 无法用 int 表示。
-			continue
-		}
 		windows = append(windows, Window{
 			FirstAxle:      first + 1,
 			LastAxle:       last + 1,
-			DisplacementMm: ev.displacementMm,
+			DisplacementMm: new(big.Int).Set(ev.displacementMm),
 			LoadKg:         new(big.Int).Set(load),
 		})
 	}
@@ -399,8 +384,8 @@ func preferred(a, b Window) bool {
 	if c := a.LoadKg.Cmp(b.LoadKg); c != 0 {
 		return c > 0
 	}
-	if a.DisplacementMm != b.DisplacementMm {
-		return a.DisplacementMm < b.DisplacementMm
+	if c := a.DisplacementMm.Cmp(b.DisplacementMm); c != 0 {
+		return c < 0
 	}
 	return a.FirstAxle < b.FirstAxle
 }

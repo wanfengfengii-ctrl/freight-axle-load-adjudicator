@@ -92,8 +92,10 @@ func TestBridgeWindow_422Cases(t *testing.T) {
 		{"位置未递增", `{"axle_positions_mm":[0,3000,1500],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"位置为负", `{"axle_positions_mm":[-1,1500,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"载荷为零", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,0,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
-		{"载荷超int64", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[9223372036854775808,1,1],"bridge_length_mm":3000,"approved_load_kg":12000}`},
-		{"位置超int64", `{"axle_positions_mm":[0,1500,9223372036854775808],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
+		{"单轴位置元素为 null", `{"axle_positions_mm":[null],"axle_loads_kg":[4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
+		{"位置元素为 null 不得当作零", `{"axle_positions_mm":[0,null,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
+		{"载荷元素为 null", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,null,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
+		{"位置数组全为 null", `{"axle_positions_mm":[null,null],"axle_loads_kg":[4000,4000],"bridge_length_mm":3000,"approved_load_kg":12000}`},
 		{"桥长低于下限", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":999,"approved_load_kg":12000}`},
 		{"桥长高于上限", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":50001,"approved_load_kg":12000}`},
 		{"核定载荷为零", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],"bridge_length_mm":3000,"approved_load_kg":0}`},
@@ -202,6 +204,77 @@ func TestBridgeWindow_ExtremePositionsExact(t *testing.T) {
 	assert.Equal(t,
 		`{"max_load_kg":5000,"first_axle":2,"last_axle":2,"displacement_mm":0,"conclusion":"通行"}`,
 		string(raw))
+}
+
+// 轴位置契约不设上限：位置本身超出平台整数上限（int64）也必须精确完成分析，
+// 不得在解析阶段失败；此时取得峰值的车辆位移同样超出 int64，
+// displacement_mm 须作为精确 JSON 数字返回（不能溢出成零或负数）。
+func TestBridgeWindow_PositionBeyondInt64Exact(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1500,9223372036854775808],"axle_loads_kg":[4000,4000,4000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":12000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	// 车头轴进入后随即离开，它不与后两轴共用桥面；车尾两轴在位移 2^63 时
+	// 一度同桥，峰值 8000，峰值位移即 2^63（超出 int64）。
+	assert.Equal(t,
+		`{"max_load_kg":8000,"first_axle":1,"last_axle":2,`+
+			`"displacement_mm":9223372036854775808,"conclusion":"通行"}`,
+		string(raw))
+}
+
+// 轴载荷契约不设上限：载荷超出平台整数上限（int64）时必须精确完成求和并返回
+// 峰值与拦停结论，不得在解析或求和前拒绝。
+func TestBridgeWindow_LoadBeyondInt64Exact(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0],"axle_loads_kg":[9223372036854775808],`+
+			`"bridge_length_mm":3000,"approved_load_kg":200000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":9223372036854775808,"first_axle":1,"last_axle":1,`+
+			`"displacement_mm":0,"conclusion":"拦停"}`,
+		string(raw))
+
+	// 多轴求和：2^63 + 1 + 1 = 9223372036854775810，峰值与结论精确。
+	code, raw = doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[9223372036854775808,1,1],`+
+			`"bridge_length_mm":3000,"approved_load_kg":200000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":9223372036854775810,"first_axle":1,"last_axle":3,`+
+			`"displacement_mm":3000,"conclusion":"拦停"}`,
+		string(raw))
+}
+
+// 位置数组中的 null 元素不得被静默当作 0 毫米：单轴车误填 null 时统一 422，
+// 错误文案点名第 1 项为 null，且绝不夹带分析结果。
+func TestBridgeWindow_NullPositionElement422(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[null],"axle_loads_kg":[4000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":12000}`)
+	require.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+	out := mustJSONMap(t, raw)
+	require.Contains(t, out, "error")
+	assert.Contains(t, out["error"], "字段类型错误")
+	assert.Contains(t, out["error"], "axle_positions_mm")
+	assert.Contains(t, out["error"], "第 1 项")
+	assert.Contains(t, out["error"], "null")
+	assert.Len(t, out, 1, "422 响应只能包含 error 字段")
+	for _, kw := range []string{"max_load_kg", "conclusion"} {
+		assert.NotContains(t, string(raw), kw)
+	}
+
+	// 载荷数组中的 null 元素同样拒绝并点名 axle_loads_kg。
+	code, raw = doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0],"axle_loads_kg":[null],`+
+			`"bridge_length_mm":3000,"approved_load_kg":12000}`)
+	require.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+	out = mustJSONMap(t, raw)
+	assert.Contains(t, out["error"], "字段类型错误")
+	assert.Contains(t, out["error"], "axle_loads_kg")
+	assert.Contains(t, out["error"], "null")
 }
 
 // 提供预计车速且存在持续超载：响应在原峰值字段后追加超载区段与累计时长，
