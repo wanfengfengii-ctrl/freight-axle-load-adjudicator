@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -50,6 +51,7 @@ func Register(r *gin.Engine) {
 	r.GET("/healthz", healthz)
 	r.POST("/api/v1/verify", handleVerify)
 	r.POST("/api/v1/retest-comparison", handleRetestComparison)
+	r.POST("/api/v1/bridge-window", handleBridgeWindow)
 }
 
 func healthz(c *gin.Context) {
@@ -249,7 +251,7 @@ func decodeMeasurement(c *gin.Context, data []byte, label string) (*verifyReques
 	// 字段名须与明确契约逐字符一致：encoding/json 的字段匹配不区分大小写
 	// （AXLE_LOADS_KG 也会命中 axle_loads_kg），仅靠 DisallowUnknownFields 无法
 	// 拒绝大小写变体，故先按契约名单精确扫描顶层键，变体一律按未知字段拒绝。
-	if key := firstNonContractKey(data); key != "" {
+	if key := firstNonContractKey(data, keyAxleLoadsKg, keyAxleSpacingsMm, keyScaleWeightKg); key != "" {
 		respond422(c, describeMeasurementDecodeError(label,
 			errors.New("json: unknown field "+strconv.Quote(key))))
 		return nil, false
@@ -308,11 +310,11 @@ const (
 	keyScaleWeightKg  = "scale_weight_kg"
 )
 
-// firstNonContractKey 扫描测量数据顶层对象的键，返回第一个不符合明确字段契约
+// firstNonContractKey 扫描顶层对象的键，返回第一个不在 allowed 契约名单中
 // 的键名；全部合法时返回空串。data 不是合法 JSON 对象（语法损坏、非对象等）
 // 时也返回空串：那些情形交由后续结构体解码按既有路径报错，此处只负责
 // 拦下“语法合法但字段名不符契约”的请求。
-func firstNonContractKey(data []byte) string {
+func firstNonContractKey(data []byte, allowed ...string) string {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	open, err := dec.Token()
 	if err != nil {
@@ -327,9 +329,7 @@ func firstNonContractKey(data []byte) string {
 			return ""
 		}
 		key, _ := keyToken.(string)
-		switch key {
-		case keyAxleLoadsKg, keyAxleSpacingsMm, keyScaleWeightKg:
-		default:
+		if !slices.Contains(allowed, key) {
 			return key
 		}
 		var skip json.RawMessage
