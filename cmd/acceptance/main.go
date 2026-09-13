@@ -1,6 +1,8 @@
 // Command acceptance 是一次性黑盒验收程序：等待服务就绪后，对运行中的 API
 // 执行 1800/1801 毫米临界两侧、非法输入 422、可重复性、地磅校准以及重测比对
-// （两次一致确认、载荷翻转、轴距重排、第二份非法无部分结果）检查，全部通过才以 0 退出。
+// （两次一致确认、载荷翻转、轴距重排、第二份非法无部分结果）检查，
+// 并校验 JSON 请求契约（非 JSON 媒体类型拒绝、字段名大小写变体按未知字段拒绝），
+// 全部通过才以 0 退出。
 package main
 
 import (
@@ -630,6 +632,79 @@ func main() {
 				if bytes.Contains(body, []byte(kw)) {
 					return fmt.Errorf("%s 的 422 夹带了部分结果（%s）: %s", tc.name, kw, body)
 				}
+			}
+		}
+		return nil
+	})
+
+	// 非 JSON 媒体类型（如 text/plain）：即使载荷格式正确，也必须按 JSON 请求契约
+	// 整体 422 拒绝，不得生成任何执法结论；两个 POST 入口行为一致。
+	check("非 JSON 媒体类型提交被 422 拒绝", func() error {
+		verifyBody := `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}`
+		bodies := map[string]string{
+			"/api/v1/verify":            verifyBody,
+			"/api/v1/retest-comparison": `{"first":` + verifyBody + `,"retest":` + verifyBody + `}`,
+		}
+		for _, path := range []string{"/api/v1/verify", "/api/v1/retest-comparison"} {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+path,
+				bytes.NewReader([]byte(bodies[path])))
+			req.Header.Set("Content-Type", "text/plain")
+			resp, err := client.Do(req)
+			if err != nil {
+				return fmt.Errorf("%s 请求失败: %w", path, err)
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnprocessableEntity {
+				return fmt.Errorf("%s 以 text/plain 提交期望 422，实际 %d，响应 %s", path, resp.StatusCode, body)
+			}
+			var errResp struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+				return fmt.Errorf("%s 的 422 响应缺少 error 字段: %s", path, body)
+			}
+			for _, kw := range []string{"groups", "vehicle", "violations",
+				"first_result", "retest_result", "conclusion"} {
+				if bytes.Contains(body, []byte(kw)) {
+					return fmt.Errorf("%s 的 422 响应夹带了裁决结果（%s）: %s", path, kw, body)
+				}
+			}
+		}
+		return nil
+	})
+
+	// 字段名大小写变体（如全大写 AXLE_LOADS_KG）不符合明确字段契约，
+	// 必须按未知字段 422 拒绝；比对入口中错误还须归因到对应那份数据。
+	check("字段名大小写变体按未知字段 422 拒绝", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/verify",
+			map[string]any{"AXLE_LOADS_KG": []int{9500, 9500}, "axle_spacings_mm": []int{1800}})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusUnprocessableEntity {
+			return fmt.Errorf("单次裁决全大写字段期望 422，实际 %d，响应 %s", code, body)
+		}
+		if !bytes.Contains(body, []byte("unknown field")) || bytes.Contains(body, []byte("groups")) {
+			return fmt.Errorf("单次裁决全大写字段应按未知字段拒绝且无部分结果: %s", body)
+		}
+
+		code, body, err = postJSON(ctx, client, base+"/api/v1/retest-comparison", map[string]any{
+			"first":  map[string]any{"axle_loads_kg": []int{9500, 9500}, "axle_spacings_mm": []int{1800}},
+			"retest": map[string]any{"AXLE_LOADS_KG": []int{9500, 9500}, "axle_spacings_mm": []int{1800}},
+		})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusUnprocessableEntity {
+			return fmt.Errorf("重测数据全大写字段期望 422，实际 %d，响应 %s", code, body)
+		}
+		if !bytes.Contains(body, []byte("重测")) || !bytes.Contains(body, []byte("unknown field")) {
+			return fmt.Errorf("错误应指出重测数据的未知字段，实际 %s", body)
+		}
+		for _, kw := range []string{"first_result", "retest_result", "conclusion"} {
+			if bytes.Contains(body, []byte(kw)) {
+				return fmt.Errorf("422 响应夹带了部分结果（%s）: %s", kw, body)
 			}
 		}
 		return nil

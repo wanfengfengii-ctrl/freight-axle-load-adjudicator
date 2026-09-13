@@ -566,6 +566,100 @@ func TestComparison_ChangesSortedByStartAxle(t *testing.T) {
 	assert.Equal(t, float64(6), ocs[2].(map[string]any)["start_axle"])
 }
 
+// ---------------------------------------------------------------------------
+// JSON 请求契约：媒体类型与字段名严格校验
+// ---------------------------------------------------------------------------
+
+// 非 JSON 媒体类型（含缺失 Content-Type）必须按 JSON 请求契约整体 422 拒绝，
+// 不得进入裁决；两个 POST 入口行为一致。
+func TestNonJSONContentTypeRejected(t *testing.T) {
+	r := newRouter(t)
+	verifyBody := `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}`
+	compareBody := `{"first":` + verifyBody + `,"retest":` + verifyBody + `}`
+	for _, path := range []string{"/api/v1/verify", "/api/v1/retest-comparison"} {
+		body := verifyBody
+		if path == "/api/v1/retest-comparison" {
+			body = compareBody
+		}
+		for _, ct := range []string{"text/plain", "text/html", "application/xml",
+			"application/x-www-form-urlencoded", ""} {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+			if ct != "" {
+				req.Header.Set("Content-Type", ct)
+			}
+			r.ServeHTTP(w, req)
+			assert.Equal(t, http.StatusUnprocessableEntity, w.Code,
+				"%s 以 Content-Type %q 提交必须 422", path, ct)
+			out := mustJSONMap(t, w.Body.Bytes())
+			require.Contains(t, out, "error")
+			// 拒绝时绝不夹带任何裁决或比对产物。
+			for _, kw := range []string{"groups", "vehicle", "violations",
+				"first_result", "retest_result", "conclusion"} {
+				assert.NotContains(t, w.Body.String(), kw, "422 响应不得出现 %s", kw)
+			}
+		}
+	}
+}
+
+// application/json 携带 charset 等参数仍是合法 JSON 媒体类型，两个入口均须接受。
+func TestJSONContentTypeWithParametersAccepted(t *testing.T) {
+	r := newRouter(t)
+	for _, ct := range []string{"application/json", "application/json; charset=utf-8", "Application/JSON"} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/verify",
+			bytes.NewBufferString(`{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}`))
+		req.Header.Set("Content-Type", ct)
+		r.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "Content-Type %q 应被接受", ct)
+	}
+}
+
+// 字段名须与明确契约逐字符一致：全大写、混合大小写等变体一律按未知字段 422 拒绝。
+func TestVerify_CaseVariantFieldsRejected(t *testing.T) {
+	r := newRouter(t)
+	for _, body := range []string{
+		`{"AXLE_LOADS_KG":[9500,9500],"axle_spacings_mm":[1800]}`,
+		`{"axle_loads_kg":[9500,9500],"AXLE_SPACINGS_MM":[1800]}`,
+		`{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800],"SCALE_WEIGHT_KG":18000}`,
+		`{"Axle_Loads_Kg":[9500,9500],"axle_spacings_mm":[1800]}`,
+	} {
+		code, out := doVerify(t, r, body)
+		assert.Equal(t, http.StatusUnprocessableEntity, code, body)
+		require.Contains(t, out, "error")
+		assert.Contains(t, out["error"], "unknown field")
+		assert.NotContains(t, out, "groups")
+	}
+}
+
+// 重测比对中任一份数据的字段名大小写变体同样按未知字段拒绝，且错误须归因到对应那份。
+func TestComparison_CaseVariantFieldsRejected(t *testing.T) {
+	r := newRouter(t)
+	valid := `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}`
+	cases := []struct {
+		name      string
+		body      string
+		wantInErr string
+	}{
+		{"重测全大写载荷字段", `{"first":` + valid + `,"retest":{"AXLE_LOADS_KG":[9500,9500],"axle_spacings_mm":[1801]}}`, "重测"},
+		{"首次全大写载荷字段", `{"first":{"AXLE_LOADS_KG":[9500,9500],"axle_spacings_mm":[1801]},"retest":` + valid + `}`, "首次"},
+		{"重测混合大小写", `{"first":` + valid + `,"retest":{"Axle_Loads_Kg":[9500,9500],"axle_spacings_mm":[1801]}}`, "重测"},
+		{"首次地磅字段全大写", `{"first":{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801],"SCALE_WEIGHT_KG":19000},"retest":` + valid + `}`, "首次"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, raw := doCompare(t, r, tc.body)
+			assert.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+			out := mustJSONMap(t, raw)
+			require.Contains(t, out, "error")
+			assert.Contains(t, out["error"], tc.wantInErr)
+			assert.Contains(t, out["error"], "unknown field")
+			assert.NotContains(t, string(raw), "first_result")
+			assert.NotContains(t, string(raw), "retest_result")
+		})
+	}
+}
+
 func toJSON(t *testing.T, v any) string {
 	t.Helper()
 	raw, err := json.Marshal(v)

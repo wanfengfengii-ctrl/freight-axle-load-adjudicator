@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -55,6 +57,10 @@ func healthz(c *gin.Context) {
 }
 
 func handleVerify(c *gin.Context) {
+	// 媒体类型须符合 JSON 请求契约：文本等其它类型（或缺失）直接 422，不进入裁决。
+	if !requireJSONContentType(c) {
+		return
+	}
 	// 输入非法时统一走 422，且在产出任何裁决结果之前拒绝，杜绝部分结果。
 	req, ok := decodeVerifyHandlerBody(c)
 	if !ok {
@@ -76,6 +82,10 @@ func handleVerify(c *gin.Context) {
 }
 
 func handleRetestComparison(c *gin.Context) {
+	// 媒体类型须符合 JSON 请求契约：文本等其它类型（或缺失）直接 422，不进入比对。
+	if !requireJSONContentType(c) {
+		return
+	}
 	// 顶层用 token 方式逐层扫描（而非一次性解到结构体）：当某一份数据的值在
 	// 解码处失败时（典型如重测数据填写到一半被截断），可把错误精确归因到
 	// first 或 retest，而不是笼统地报整个请求体不完整。
@@ -236,6 +246,14 @@ func decodeMeasurement(c *gin.Context, data []byte, label string) (*verifyReques
 			return nil, false
 		}
 	}
+	// 字段名须与明确契约逐字符一致：encoding/json 的字段匹配不区分大小写
+	// （AXLE_LOADS_KG 也会命中 axle_loads_kg），仅靠 DisallowUnknownFields 无法
+	// 拒绝大小写变体，故先按契约名单精确扫描顶层键，变体一律按未知字段拒绝。
+	if key := firstNonContractKey(data); key != "" {
+		respond422(c, describeMeasurementDecodeError(label,
+			errors.New("json: unknown field "+strconv.Quote(key))))
+		return nil, false
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var req verifyRequest
@@ -261,6 +279,65 @@ func labelMsg(label, msg string) string {
 		return msg
 	}
 	return label + msg
+}
+
+// jsonMediaType 为请求契约要求的媒体类型；charset 等参数允许携带。
+const jsonMediaType = "application/json"
+
+// requireJSONContentType 按 JSON 请求契约校验 Content-Type：媒体类型必须为
+// application/json（媒体类型本身大小写不敏感，charset 等参数不影响判定）。
+// 文本等其它媒体类型、或缺失 Content-Type 时整体 422，不进入任何裁决。
+func requireJSONContentType(c *gin.Context) bool {
+	ct := c.GetHeader("Content-Type")
+	if ct == "" {
+		respond422(c, "缺少 Content-Type 请求头：请求契约要求以 JSON 提交（Content-Type: application/json）")
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil || mediaType != jsonMediaType {
+		respond422(c, "请求媒体类型须为 application/json（JSON 请求契约），实际为 "+strconv.Quote(ct))
+		return false
+	}
+	return true
+}
+
+// 测量数据明确约定的字段名；其它任何拼写（含大小写变体）都视为未知字段。
+const (
+	keyAxleLoadsKg    = "axle_loads_kg"
+	keyAxleSpacingsMm = "axle_spacings_mm"
+	keyScaleWeightKg  = "scale_weight_kg"
+)
+
+// firstNonContractKey 扫描测量数据顶层对象的键，返回第一个不符合明确字段契约
+// 的键名；全部合法时返回空串。data 不是合法 JSON 对象（语法损坏、非对象等）
+// 时也返回空串：那些情形交由后续结构体解码按既有路径报错，此处只负责
+// 拦下“语法合法但字段名不符契约”的请求。
+func firstNonContractKey(data []byte) string {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	open, err := dec.Token()
+	if err != nil {
+		return ""
+	}
+	if delim, isDelim := open.(json.Delim); !isDelim || delim != '{' {
+		return ""
+	}
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		key, _ := keyToken.(string)
+		switch key {
+		case keyAxleLoadsKg, keyAxleSpacingsMm, keyScaleWeightKg:
+		default:
+			return key
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return ""
+		}
+	}
+	return ""
 }
 
 // evaluateRequest 按单次裁决契约执行裁决：带地磅重量时先校准再裁决，否则直接裁决。
