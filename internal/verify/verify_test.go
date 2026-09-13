@@ -262,3 +262,146 @@ func TestValidate_BoundaryInputsAccepted(t *testing.T) {
 	assert.Equal(t, 20001, res.Groups[0].LoadKg)
 	assert.True(t, res.Groups[0].OverLimit)
 }
+
+func TestCalibrate_PositiveDifferenceTieBreaksByAxleOrder(t *testing.T) {
+	// 差额 +1：两轴小数部分相同（各 0.5），轴序号小的优先补 1。
+	got := Calibrate([]int{9500, 9500}, 19001)
+	require.Equal(t, []int{9501, 9500}, got)
+}
+
+func TestCalibrate_NegativeDifferenceTieBreaksByAxleOrder(t *testing.T) {
+	// 差额 -1：各轴份额 -0.5 向下取整为 -1，小数部分相同，
+	// 轴序号小的优先补回 1，差额最终落在尾轴。
+	got := Calibrate([]int{9500, 9500}, 18999)
+	require.Equal(t, []int{9500, 9499}, got)
+}
+
+func TestCalibrate_ProportionalToOriginalLoads(t *testing.T) {
+	// 差额 +3 按 2:1:1 分摊：精确份额 1.5 / 0.75 / 0.75，取整后余 2 千克，
+	// 小数部分 0.75 的第 2、3 轴（同余按轴序）各补 1。
+	got := Calibrate([]int{10000, 5000, 5000}, 20003)
+	require.Equal(t, []int{10001, 5001, 5001}, got)
+}
+
+func TestCalibrate_SumConservedAndRepeatable(t *testing.T) {
+	cases := []struct {
+		name  string
+		loads []int
+		scale int
+	}{
+		{"零差额原样返回", []int{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, 12},
+		{"正差额", []int{3, 7, 11, 13, 17}, 55},
+		{"负差额", []int{20000, 20000, 20000}, 58000},
+		{"载荷大小悬殊", []int{1, 20000, 1, 20000, 1}, 38000},
+		{"五轴负差额", []int{10000, 10000, 10000, 10000, 10000}, 49000},
+		{"单轴直接取地磅值", []int{5000}, 5001},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			first := Calibrate(tc.loads, tc.scale)
+			second := Calibrate(tc.loads, tc.scale)
+			require.Equal(t, first, second, "同一输入必须得到同一校准结果")
+			require.Len(t, first, len(tc.loads))
+			sum := 0
+			for _, v := range first {
+				sum += v
+			}
+			require.Equal(t, tc.scale, sum, "校准后各轴之和必须严格等于地磅重量")
+		})
+	}
+}
+
+func TestEvaluateWithScale_CalibrationFlipsGroupVerdict(t *testing.T) {
+	// 原始双轴组 18400 > 18000 超限；地磅 18000 校准为 [9000,9000]，
+	// 组载荷 18000 等于限值合规，结论翻转。
+	res, err := EvaluateWithScale([]int{9200, 9200}, []int{1800}, 18000)
+	require.NoError(t, err)
+	require.NotNil(t, res.Calibration)
+	assert.Equal(t, CalibrationResult{
+		ScaleWeightKg:     18000,
+		OriginalTotalKg:   18400,
+		DifferenceKg:      -400,
+		CalibratedLoadsKg: []int{9000, 9000},
+	}, *res.Calibration)
+	require.Len(t, res.Groups, 1)
+	assert.Equal(t, 18000, res.Groups[0].LoadKg)
+	assert.False(t, res.Groups[0].OverLimit)
+	assert.Equal(t, 18000, res.Vehicle.LoadKg)
+	assert.False(t, res.Vehicle.OverLimit)
+	assert.Empty(t, res.Violations)
+
+	// 同一载荷不带地磅重量时仍超限，确认翻转来自校准而非规则变化。
+	plain, err := Evaluate([]int{9200, 9200}, []int{1800})
+	require.NoError(t, err)
+	assert.True(t, plain.Groups[0].OverLimit)
+	assert.Nil(t, plain.Calibration, "未携带地磅重量的结果不得含校准信息")
+}
+
+func TestEvaluateWithScale_CalibrationFlipsVehicleVerdict(t *testing.T) {
+	// 5 个单轴组合计 49050 > 49000 整车超限；地磅 49000 校准后等于限值合规。
+	loads := []int{9810, 9810, 9810, 9810, 9810}
+	spacings := []int{1801, 1801, 1801, 1801}
+	res, err := EvaluateWithScale(loads, spacings, 49000)
+	require.NoError(t, err)
+	require.NotNil(t, res.Calibration)
+	assert.Equal(t, []int{9800, 9800, 9800, 9800, 9800}, res.Calibration.CalibratedLoadsKg)
+	assert.Equal(t, 49000, res.Vehicle.LoadKg)
+	assert.False(t, res.Vehicle.OverLimit)
+	assert.Empty(t, res.Violations)
+}
+
+func TestEvaluateWithScale_DeviationBoundary(t *testing.T) {
+	// 合计 20000：偏差恰好 5%（±1000）允许，1001 拒绝。
+	res, err := EvaluateWithScale([]int{10000, 10000}, []int{1801}, 21000)
+	require.NoError(t, err)
+	assert.Equal(t, 21000, res.Vehicle.LoadKg)
+
+	res, err = EvaluateWithScale([]int{10000, 10000}, []int{1801}, 19000)
+	require.NoError(t, err)
+	assert.Equal(t, 19000, res.Vehicle.LoadKg)
+
+	for _, scale := range []int{21001, 18999} {
+		res, err := EvaluateWithScale([]int{10000, 10000}, []int{1801}, scale)
+		require.Error(t, err)
+		assert.Nil(t, res, "偏差超界不得给出任何部分结果")
+		assert.Contains(t, err.Error(), "偏差超过")
+	}
+}
+
+func TestEvaluateWithScale_ScaleWeightRange(t *testing.T) {
+	for _, scale := range []int{0, -1, 240001} {
+		res, err := EvaluateWithScale([]int{10000, 10000}, []int{1801}, scale)
+		require.Error(t, err)
+		assert.Nil(t, res, "地磅重量越界不得给出任何部分结果")
+	}
+
+	// 边界 1 与 240000 合法（偏差须在 5% 以内）。
+	res, err := EvaluateWithScale([]int{1}, nil, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Vehicle.LoadKg)
+
+	loads := make([]int, 12)
+	spacings := make([]int, 11)
+	for i := range loads {
+		loads[i] = 20000
+	}
+	for i := range spacings {
+		spacings[i] = 10000 // 全部 >1800，12 个单轴组
+	}
+	res, err = EvaluateWithScale(loads, spacings, 240000)
+	require.NoError(t, err)
+	assert.Equal(t, 240000, res.Vehicle.LoadKg)
+	assert.Equal(t, 0, res.Calibration.DifferenceKg)
+	assert.Equal(t, loads, res.Calibration.CalibratedLoadsKg, "零差额时校准载荷与原载荷一致")
+}
+
+func TestEvaluateWithScale_InvalidAxleInputStillRejected(t *testing.T) {
+	// 携带地磅重量不改变既有校验：四轴组、载荷越界等仍整体拒绝。
+	res, err := EvaluateWithScale([]int{1, 1, 1, 1}, []int{1800, 1800, 1800}, 4)
+	require.Error(t, err)
+	assert.Nil(t, res)
+
+	res, err = EvaluateWithScale([]int{0, 1}, []int{1000}, 1)
+	require.Error(t, err)
+	assert.Nil(t, res)
+}

@@ -1,7 +1,10 @@
 // Package verify 实现货车轴组划分与超限裁决规则，不包含任何 HTTP 细节。
 package verify
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // 输入与裁决常量，单位见字段名。
 const (
@@ -13,6 +16,11 @@ const (
 	MaxSpacingMm   = 10000
 	SameGroupMaxMm = 1800 // 相邻轴距 <= 1800mm 同组，> 1800mm 另起一组
 	VehicleLimitKg = 49000
+
+	MinScaleWeightKg = 1
+	MaxScaleWeightKg = 240000
+	// MaxScaleDeviationPercent 为地磅重量与轴载荷合计允许的最大偏差百分比（含边界）。
+	MaxScaleDeviationPercent = 5
 )
 
 // groupLimitKg 按轴组内轴数给出限值：单轴 10000、双轴 18000、三轴 24000。
@@ -46,11 +54,21 @@ type Violation struct {
 	Index int    `json:"index,omitempty"` // scope 为 group 时的组序号
 }
 
+// CalibrationResult 记录一次地磅校准的输入与结果。
+// 校准后各轴之和严格等于地磅重量，轴组与整车裁决均使用校准值。
+type CalibrationResult struct {
+	ScaleWeightKg     int   `json:"scale_weight_kg"`     // 收费站地磅整车重量
+	OriginalTotalKg   int   `json:"original_total_kg"`   // 校准前轴载荷合计
+	DifferenceKg      int   `json:"difference_kg"`       // 校准差额 = 地磅重量 − 原始合计（可正可负）
+	CalibratedLoadsKg []int `json:"calibrated_loads_kg"` // 各轴校准载荷，轴序与请求一致
+}
+
 // Result 是一次复核的完整裁决结果，不含任何错误信息（非法输入不会产生部分结果）。
 type Result struct {
-	Groups     []GroupResult `json:"groups"`
-	Vehicle    VehicleResult `json:"vehicle"`
-	Violations []Violation   `json:"violations"`
+	Groups      []GroupResult      `json:"groups"`
+	Vehicle     VehicleResult      `json:"vehicle"`
+	Violations  []Violation        `json:"violations"`
+	Calibration *CalibrationResult `json:"calibration,omitempty"` // 仅携带地磅重量的请求存在
 }
 
 // Validate 仅校验输入合法性，不产出裁决结果。
@@ -103,7 +121,108 @@ func Evaluate(axleLoadsKg []int, axleSpacingsMm []int) (*Result, error) {
 	if err := Validate(axleLoadsKg, axleSpacingsMm); err != nil {
 		return nil, err
 	}
+	return evaluate(axleLoadsKg, axleSpacingsMm)
+}
 
+// EvaluateWithScale 先按地磅整车重量校准各轴载荷，再按现有轴距分组与限值裁决。
+// 地磅重量超出 1-240000 千克，或与轴载荷合计的偏差超过 5% 时返回 error，
+// 调用方必须整体拒绝，不得使用部分结果。
+func EvaluateWithScale(axleLoadsKg []int, axleSpacingsMm []int, scaleWeightKg int) (*Result, error) {
+	if err := Validate(axleLoadsKg, axleSpacingsMm); err != nil {
+		return nil, err
+	}
+	if scaleWeightKg < MinScaleWeightKg || scaleWeightKg > MaxScaleWeightKg {
+		return nil, fmt.Errorf("地磅整车重量 %d 超出允许范围 %d-%d 千克",
+			scaleWeightKg, MinScaleWeightKg, MaxScaleWeightKg)
+	}
+	total := 0
+	for _, load := range axleLoadsKg {
+		total += load
+	}
+	diff := scaleWeightKg - total
+	// 偏差超过 5% 才拒绝（恰好 5% 允许）：|diff|/total > 5% 等价于
+	// |diff|*100 > total*5，全程整数比较，避免浮点误差影响边界判定。
+	if absInt(diff)*100 > total*MaxScaleDeviationPercent {
+		return nil, fmt.Errorf("地磅整车重量与轴载荷合计的偏差超过 %d%%，不予校准", MaxScaleDeviationPercent)
+	}
+
+	calibrated := Calibrate(axleLoadsKg, scaleWeightKg)
+	res, err := evaluate(calibrated, axleSpacingsMm)
+	if err != nil {
+		return nil, err
+	}
+	res.Calibration = &CalibrationResult{
+		ScaleWeightKg:     scaleWeightKg,
+		OriginalTotalKg:   total,
+		DifferenceKg:      diff,
+		CalibratedLoadsKg: calibrated,
+	}
+	return res, nil
+}
+
+// Calibrate 把地磅重量与轴载荷合计的差额按各轴原载荷比例分摊：
+// 每轴先取精确份额的向下取整部分，剩余整数千克按小数部分从大到小、
+// 轴序号从小到大逐轴补 1，保证校准后各轴之和严格等于地磅重量，
+// 且同一输入永远得到同一结果。调用前必须完成 Validate 与偏差校验。
+func Calibrate(axleLoadsKg []int, scaleWeightKg int) []int {
+	total := 0
+	for _, load := range axleLoadsKg {
+		total += load
+	}
+	diff := scaleWeightKg - total
+
+	n := len(axleLoadsKg)
+	floors := make([]int, n)
+	remainders := make([]int, n) // 各轴份额的小数部分分子（分母同为 total），取值 [0, total)
+	rest := diff                 // 向下取整后尚需补齐的整数千克，等于余数分子之和 / total
+	for i, load := range axleLoadsKg {
+		floors[i] = floorDiv(diff*load, total)
+		remainders[i] = diff*load - floors[i]*total
+		rest -= floors[i]
+	}
+
+	// 补齐顺序：小数部分大的优先，相等时轴序号小的优先。
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		i, j := order[a], order[b]
+		if remainders[i] != remainders[j] {
+			return remainders[i] > remainders[j]
+		}
+		return i < j
+	})
+
+	calibrated := make([]int, n)
+	for i, load := range axleLoadsKg {
+		calibrated[i] = load + floors[i]
+	}
+	for k := 0; k < rest; k++ {
+		calibrated[order[k]]++
+	}
+	return calibrated
+}
+
+// floorDiv 返回 a/b 向下取整（向负无穷方向）的商，b 必须为正数。
+func floorDiv(a, b int) int {
+	q := a / b
+	if a%b != 0 && a < 0 {
+		q--
+	}
+	return q
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// evaluate 对已校验的输入执行分组与裁决，axleLoadsKg 为实际参与裁决的载荷
+// （可能是地磅校准后的值），不再重复校验载荷范围。
+func evaluate(axleLoadsKg []int, axleSpacingsMm []int) (*Result, error) {
 	spans := splitGroups(len(axleLoadsKg), axleSpacingsMm)
 	groups := make([]GroupResult, 0, len(spans))
 	violations := make([]Violation, 0)

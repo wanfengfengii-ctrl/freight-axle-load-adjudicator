@@ -154,3 +154,103 @@ func TestHealthz(t *testing.T) {
 func TestLimitsMatchDomain(t *testing.T) {
 	assert.Equal(t, 49000, verify.VehicleLimitKg)
 }
+
+func TestVerify_ScaleWeightCalibratesAndFlipsVerdict(t *testing.T) {
+	r := newRouter(t)
+
+	// 不带地磅重量：双轴组 18400 > 18000 超限，且无 calibration 字段。
+	code, out := doVerify(t, r, `{"axle_loads_kg":[9200,9200],"axle_spacings_mm":[1800]}`)
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, true, out["groups"].([]any)[0].(map[string]any)["over_limit"])
+	assert.NotContains(t, out, "calibration")
+
+	// 携带地磅重量 18000：校准为 [9000,9000]，组载荷等于限值合规，结论翻转。
+	code, out = doVerify(t, r, `{"axle_loads_kg":[9200,9200],"axle_spacings_mm":[1800],"scale_weight_kg":18000}`)
+	require.Equal(t, http.StatusOK, code)
+	cal, ok := out["calibration"].(map[string]any)
+	require.True(t, ok, "携带地磅重量的响应必须含 calibration: %v", out)
+	assert.Equal(t, float64(18000), cal["scale_weight_kg"])
+	assert.Equal(t, float64(18400), cal["original_total_kg"])
+	assert.Equal(t, float64(-400), cal["difference_kg"])
+	assert.Equal(t, []any{float64(9000), float64(9000)}, cal["calibrated_loads_kg"])
+	g0 := out["groups"].([]any)[0].(map[string]any)
+	assert.Equal(t, float64(18000), g0["load_kg"])
+	assert.Equal(t, false, g0["over_limit"])
+	vehicle := out["vehicle"].(map[string]any)
+	assert.Equal(t, float64(18000), vehicle["load_kg"])
+	assert.Equal(t, false, vehicle["over_limit"])
+	assert.Empty(t, out["violations"])
+}
+
+func TestVerify_ScaleWeightDeviationOver5PercentIs422(t *testing.T) {
+	r := newRouter(t)
+	// 合计 20000，地磅 21001 偏差 1001 > 5%：422 且只说明偏差超界，无任何部分结果。
+	code, out := doVerify(t, r, `{"axle_loads_kg":[10000,10000],"axle_spacings_mm":[1801],"scale_weight_kg":21001}`)
+	assert.Equal(t, http.StatusUnprocessableEntity, code)
+	require.Contains(t, out, "error")
+	assert.Contains(t, out["error"], "偏差超过")
+	assert.NotContains(t, out, "groups")
+	assert.NotContains(t, out, "vehicle")
+	assert.NotContains(t, out, "violations")
+	assert.NotContains(t, out, "calibration")
+
+	// 恰好 5% 边界允许。
+	code, out = doVerify(t, r, `{"axle_loads_kg":[10000,10000],"axle_spacings_mm":[1801],"scale_weight_kg":21000}`)
+	assert.Equal(t, http.StatusOK, code)
+	assert.Contains(t, out, "calibration")
+}
+
+func TestVerify_ScaleWeightInvalidIs422(t *testing.T) {
+	r := newRouter(t)
+	for _, body := range []string{
+		`{"axle_loads_kg":[10000,10000],"axle_spacings_mm":[1801],"scale_weight_kg":0}`,
+		`{"axle_loads_kg":[10000,10000],"axle_spacings_mm":[1801],"scale_weight_kg":-5}`,
+		`{"axle_loads_kg":[10000,10000],"axle_spacings_mm":[1801],"scale_weight_kg":240001}`,
+		`{"axle_loads_kg":[10000,10000],"axle_spacings_mm":[1801],"scale_weight_kg":1.5}`,
+		`{"axle_loads_kg":[10000,10000],"axle_spacings_mm":[1801],"scale_weight_kg":"18000"}`,
+	} {
+		code, out := doVerify(t, r, body)
+		assert.Equal(t, http.StatusUnprocessableEntity, code, body)
+		assert.Contains(t, out, "error")
+		assert.NotContains(t, out, "groups")
+		assert.NotContains(t, out, "calibration")
+	}
+}
+
+func TestVerify_NullScaleWeightTreatedAsAbsent(t *testing.T) {
+	r := newRouter(t)
+	code, out := doVerify(t, r, `{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800],"scale_weight_kg":null}`)
+	assert.Equal(t, http.StatusOK, code)
+	assert.NotContains(t, out, "calibration")
+}
+
+// 未携带 scale_weight_kg 的响应必须与引入校准能力前逐字节一致。
+func TestVerify_NoScaleWeightResponseByteIdentical(t *testing.T) {
+	r := newRouter(t)
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"1800mm 同组超限",
+			`{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1800]}`,
+			`{"groups":[{"index":1,"start_axle":1,"end_axle":2,"axle_count":2,"load_kg":19000,"limit_kg":18000,"over_limit":true}],"vehicle":{"load_kg":19000,"limit_kg":49000,"over_limit":false},"violations":[{"scope":"group","index":1}]}`,
+		},
+		{
+			"1801mm 拆组合规",
+			`{"axle_loads_kg":[9500,9500],"axle_spacings_mm":[1801]}`,
+			`{"groups":[{"index":1,"start_axle":1,"end_axle":1,"axle_count":1,"load_kg":9500,"limit_kg":10000,"over_limit":false},{"index":2,"start_axle":2,"end_axle":2,"axle_count":1,"load_kg":9500,"limit_kg":10000,"over_limit":false}],"vehicle":{"load_kg":19000,"limit_kg":49000,"over_limit":false},"violations":[]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/verify", bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, tc.want, w.Body.String())
+		})
+	}
+}

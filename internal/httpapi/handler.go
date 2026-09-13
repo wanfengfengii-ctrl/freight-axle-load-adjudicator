@@ -18,17 +18,22 @@ const maxBodyBytes = 1 << 20
 type verifyRequest struct {
 	AxleLoadsKg    []int `json:"axle_loads_kg"`
 	AxleSpacingsMm []int `json:"axle_spacings_mm"`
+	// ScaleWeightKg 选填：收费站地磅整车重量。提供时先按比例校准各轴载荷再裁决；
+	// 缺省或 null 时不校准，响应与引入该校准能力前逐字节一致。
+	ScaleWeightKg *int `json:"scale_weight_kg"`
 }
 
 type errorResponse struct {
 	Error string `json:"error"`
 }
 
-// successResponse 成功裁决响应：先列各组，再列整车，最后列超限清单。
+// successResponse 成功裁决响应：先列各组，再列整车，最后列超限清单；
+// 仅携带地磅重量的请求在末尾追加 calibration 校准信息。
 type successResponse struct {
-	Groups     []verify.GroupResult `json:"groups"`
-	Vehicle    verify.VehicleResult `json:"vehicle"`
-	Violations []verify.Violation   `json:"violations"`
+	Groups      []verify.GroupResult      `json:"groups"`
+	Vehicle     verify.VehicleResult      `json:"vehicle"`
+	Violations  []verify.Violation        `json:"violations"`
+	Calibration *verify.CalibrationResult `json:"calibration,omitempty"`
 }
 
 // Register 在给定引擎上注册全部路由。
@@ -71,16 +76,23 @@ func handleVerify(c *gin.Context) {
 		return
 	}
 
-	result, err := verify.Evaluate(req.AxleLoadsKg, req.AxleSpacingsMm)
+	var result *verify.Result
+	var err error
+	if req.ScaleWeightKg != nil {
+		result, err = verify.EvaluateWithScale(req.AxleLoadsKg, req.AxleSpacingsMm, *req.ScaleWeightKg)
+	} else {
+		result, err = verify.Evaluate(req.AxleLoadsKg, req.AxleSpacingsMm)
+	}
 	if err != nil {
 		respond422(c, err.Error())
 		return
 	}
 
 	c.JSON(http.StatusOK, successResponse{
-		Groups:     result.Groups,
-		Vehicle:    result.Vehicle,
-		Violations: result.Violations,
+		Groups:      result.Groups,
+		Vehicle:     result.Vehicle,
+		Violations:  result.Violations,
+		Calibration: result.Calibration,
 	})
 }
 
@@ -93,7 +105,7 @@ func describeDecodeError(err error) string {
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		return "请求体为空或 JSON 不完整，须提交包含 axle_loads_kg 与 axle_spacings_mm 的 JSON 对象"
 	case errors.As(err, new(*json.UnmarshalTypeError)):
-		return "字段类型错误：axle_loads_kg 与 axle_spacings_mm 必须为整数数组"
+		return "字段类型错误：axle_loads_kg 与 axle_spacings_mm 必须为整数数组，scale_weight_kg 必须为整数"
 	default:
 		// 含语法错误、未知字段、数字写入整型失败（如 1.5、超大数）等。
 		return "JSON 解析失败：" + err.Error()

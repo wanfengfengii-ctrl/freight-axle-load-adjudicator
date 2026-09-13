@@ -200,6 +200,146 @@ func main() {
 		return nil
 	})
 
+	// 地磅校准：同一载荷未校准时双轴组 18400 > 18000 超限；
+	// 携带地磅 18000 校准为 [9000,9000] 后等于限值合规，结论翻转。
+	check("地磅校准后超限结论翻转", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/verify",
+			map[string]any{"axle_loads_kg": []int{9200, 9200}, "axle_spacings_mm": []int{1800}})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK || !bytes.Contains(body, []byte(`"over_limit":true`)) {
+			return fmt.Errorf("未校准时期望组超限，实际 %d，响应 %s", code, body)
+		}
+
+		code, body, err = postJSON(ctx, client, base+"/api/v1/verify",
+			map[string]any{
+				"axle_loads_kg":    []int{9200, 9200},
+				"axle_spacings_mm": []int{1800},
+				"scale_weight_kg":  18000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			Groups []struct {
+				LoadKg    int  `json:"load_kg"`
+				OverLimit bool `json:"over_limit"`
+			} `json:"groups"`
+			Vehicle struct {
+				LoadKg    int  `json:"load_kg"`
+				OverLimit bool `json:"over_limit"`
+			} `json:"vehicle"`
+			Violations  []any `json:"violations"`
+			Calibration struct {
+				ScaleWeightKg     int   `json:"scale_weight_kg"`
+				OriginalTotalKg   int   `json:"original_total_kg"`
+				DifferenceKg      int   `json:"difference_kg"`
+				CalibratedLoadsKg []int `json:"calibrated_loads_kg"`
+			} `json:"calibration"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		if len(got.Groups) != 1 || got.Groups[0].LoadKg != 18000 || got.Groups[0].OverLimit {
+			return fmt.Errorf("校准后轴组裁决不符: %+v", got.Groups)
+		}
+		if got.Vehicle.LoadKg != 18000 || got.Vehicle.OverLimit || len(got.Violations) != 0 {
+			return fmt.Errorf("校准后整车裁决不符: %+v，超限清单 %+v", got.Vehicle, got.Violations)
+		}
+		cal := got.Calibration
+		if cal.ScaleWeightKg != 18000 || cal.OriginalTotalKg != 18400 || cal.DifferenceKg != -400 ||
+			len(cal.CalibratedLoadsKg) != 2 || cal.CalibratedLoadsKg[0] != 9000 || cal.CalibratedLoadsKg[1] != 9000 {
+			return fmt.Errorf("校准信息不符: %+v", cal)
+		}
+		return nil
+	})
+
+	// 地磅重量与轴载荷合计偏差超过 5%：422 且不得夹带任何部分结果。
+	check("地磅偏差超过 5% 返回 422 且无部分结果", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/verify",
+			map[string]any{
+				"axle_loads_kg":    []int{10000, 10000},
+				"axle_spacings_mm": []int{1801},
+				"scale_weight_kg":  21001,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusUnprocessableEntity {
+			return fmt.Errorf("期望 422，实际 %d，响应 %s", code, body)
+		}
+		for _, kw := range []string{"groups", "vehicle", "violations", "calibration"} {
+			if bytes.Contains(body, []byte(kw)) {
+				return fmt.Errorf("422 响应夹带了部分结果（%s）: %s", kw, body)
+			}
+		}
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+			return fmt.Errorf("422 响应缺少 error 字段: %s", body)
+		}
+		return nil
+	})
+
+	// 携带地磅重量的同一请求两次，响应同样必须逐字节一致（校准结果可重复）。
+	check("相同地磅校准请求两次响应逐字节一致", func() error {
+		req := map[string]any{
+			"axle_loads_kg":    []int{9200, 9200},
+			"axle_spacings_mm": []int{1800},
+			"scale_weight_kg":  18000,
+		}
+		_, first, err := postJSON(ctx, client, base+"/api/v1/verify", req)
+		if err != nil {
+			return err
+		}
+		_, second, err := postJSON(ctx, client, base+"/api/v1/verify", req)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(first, second) {
+			return fmt.Errorf("响应不一致:\n%s\n%s", first, second)
+		}
+		return nil
+	})
+
+	// 未携带地磅重量的 1800/1801 请求：响应与校准能力引入前逐字节一致。
+	check("未携带地磅重量的 1800/1801 响应逐字节不变", func() error {
+		cases := []struct {
+			name string
+			req  map[string]any
+			want string
+		}{
+			{
+				"1800mm",
+				map[string]any{"axle_loads_kg": []int{9500, 9500}, "axle_spacings_mm": []int{1800}},
+				`{"groups":[{"index":1,"start_axle":1,"end_axle":2,"axle_count":2,"load_kg":19000,"limit_kg":18000,"over_limit":true}],"vehicle":{"load_kg":19000,"limit_kg":49000,"over_limit":false},"violations":[{"scope":"group","index":1}]}`,
+			},
+			{
+				"1801mm",
+				map[string]any{"axle_loads_kg": []int{9500, 9500}, "axle_spacings_mm": []int{1801}},
+				`{"groups":[{"index":1,"start_axle":1,"end_axle":1,"axle_count":1,"load_kg":9500,"limit_kg":10000,"over_limit":false},{"index":2,"start_axle":2,"end_axle":2,"axle_count":1,"load_kg":9500,"limit_kg":10000,"over_limit":false}],"vehicle":{"load_kg":19000,"limit_kg":49000,"over_limit":false},"violations":[]}`,
+			},
+		}
+		for _, tc := range cases {
+			code, body, err := postJSON(ctx, client, base+"/api/v1/verify", tc.req)
+			if err != nil {
+				return err
+			}
+			if code != http.StatusOK {
+				return fmt.Errorf("%s 期望 200，实际 %d，响应 %s", tc.name, code, body)
+			}
+			if string(body) != tc.want {
+				return fmt.Errorf("%s 响应发生变化:\n期望 %s\n实际 %s", tc.name, tc.want, body)
+			}
+		}
+		return nil
+	})
+
 	if failures > 0 {
 		fmt.Printf("\n验收未通过：%d 项失败\n", failures)
 		os.Exit(1)
