@@ -52,6 +52,7 @@ func Register(r *gin.Engine) {
 	r.POST("/api/v1/verify", handleVerify)
 	r.POST("/api/v1/retest-comparison", handleRetestComparison)
 	r.POST("/api/v1/bridge-window", handleBridgeWindow)
+	r.POST("/api/v1/wheel-balance", handleWheelBalance)
 }
 
 func healthz(c *gin.Context) {

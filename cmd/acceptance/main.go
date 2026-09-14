@@ -6,7 +6,10 @@
 // 触发拦停、并列峰值选择最早事件、位置重复只返回错误信封、极大轴位置与载荷
 // 精确计算不溢出）；桥面窗口携带预计车速时，验收持续超载区段载荷与向上取整
 // 时长、载荷变化时不同恒定载荷区段不合并、同位移进出的瞬时超载只影响原峰值
-// 且累计时长为零，以及省略车速时既有响应字节不变，
+// 且累计时长为零，以及省略车速时既有响应字节不变；
+// 最后验收左右轮重平衡评估（完全平衡放行、恰好等于阈值放行、超阈值时按轴序
+// 返回全部超界轴并要求复检、两侧长度不一致与其它非法输入只返回错误信封、
+// 非 JSON 媒体类型拒绝及响应可重复性），
 // 全部通过才以 0 退出。
 package main
 
@@ -1137,6 +1140,260 @@ func main() {
 		return nil
 	})
 
+	// ---- 左右轮重平衡评估入口 POST /api/v1/wheel-balance ----
+
+	// 完全平衡：各轴左右轮载荷相等，偏差千分比全为 0，全车放行。
+	check("轮重平衡：完全平衡时放行", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/wheel-balance",
+			map[string]any{
+				"left_wheel_loads_kg":  []int{5000, 1, 150000},
+				"right_wheel_loads_kg": []int{5000, 1, 150000},
+				"tolerance_permille":   50,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			Axles []struct {
+				TotalKg           int  `json:"total_kg"`
+				ImbalancePermille int  `json:"imbalance_permille"`
+				OverTolerance     bool `json:"over_tolerance"`
+			} `json:"axles"`
+			Conclusion string `json:"conclusion"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		require := []struct{ total, permille int }{
+			{10000, 0}, {2, 0}, {300000, 0},
+		}
+		if len(got.Axles) != len(require) {
+			return fmt.Errorf("期望 %d 轴，实际 %d", len(require), len(got.Axles))
+		}
+		for i, w := range require {
+			a := got.Axles[i]
+			if a.TotalKg != w.total || a.ImbalancePermille != w.permille || a.OverTolerance {
+				return fmt.Errorf("第 %d 轴不符：期望总重 %d 偏差 %d‰ 不超界，实际 %+v",
+					i+1, w.total, w.permille, a)
+			}
+		}
+		if got.Conclusion != "放行" {
+			return fmt.Errorf("期望放行，实际 %q", got.Conclusion)
+		}
+		return nil
+	})
+
+	// 恰好等于阈值：|差|×1000 == 总重×阈值 时 over_tolerance=false、放行；
+	// 再大 2 千克（总重为偶数，最小可达越界差）即翻转为超界。全程整数交叉乘法，
+	// 不允许因浮点舍入把边界请求误判为超界。
+	check("轮重平衡：恰好等于阈值时放行", func() error {
+		// 总重 2000、差 100：100000 == 2000×50，偏差恰好 50‰。
+		code, body, err := postJSON(ctx, client, base+"/api/v1/wheel-balance",
+			map[string]any{
+				"left_wheel_loads_kg":  []int{1050},
+				"right_wheel_loads_kg": []int{950},
+				"tolerance_permille":   50,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK ||
+			!bytes.Contains(body, []byte(`"imbalance_permille":50`)) ||
+			bytes.Contains(body, []byte(`"over_tolerance":true`)) ||
+			!bytes.Contains(body, []byte(`"conclusion":"放行"`)) {
+			return fmt.Errorf("恰好等于阈值应放行且偏差为 50‰，实际 %d，响应 %s", code, body)
+		}
+
+		// 差 102：102000 > 100000，越界；ceil(102000/2000)=51。
+		code, body, err = postJSON(ctx, client, base+"/api/v1/wheel-balance",
+			map[string]any{
+				"left_wheel_loads_kg":  []int{1051},
+				"right_wheel_loads_kg": []int{949},
+				"tolerance_permille":   50,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK ||
+			!bytes.Contains(body, []byte(`"imbalance_permille":51`)) ||
+			!bytes.Contains(body, []byte(`"over_tolerance":true`)) ||
+			!bytes.Contains(body, []byte(`"conclusion":"要求复检"`)) {
+			return fmt.Errorf("越过阈值 1 千克应要求复检，实际 %d，响应 %s", code, body)
+		}
+		return nil
+	})
+
+	// 超过阈值：未超界、恰好临界、超界轴夹杂排列时，按轴序返回全部超界轴
+	// （第 3、4 轴），全车结论为要求复检。
+	check("轮重平衡：超过阈值时按轴序返回全部超界轴并要求复检", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/wheel-balance",
+			map[string]any{
+				// 各轴总重均为 2000，差值依次为 80/100/120/104/0 千克，
+				// 偏差 40/50/60/52/0‰，阈值 50‰ 时第 3、4 轴超界。
+				"left_wheel_loads_kg":  []int{1040, 1050, 1060, 948, 1000},
+				"right_wheel_loads_kg": []int{960, 950, 940, 1052, 1000},
+				"tolerance_permille":   50,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			Axles []struct {
+				TotalKg           int  `json:"total_kg"`
+				ImbalancePermille int  `json:"imbalance_permille"`
+				OverTolerance     bool `json:"over_tolerance"`
+			} `json:"axles"`
+			Conclusion string `json:"conclusion"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		wantPermille := []int{40, 50, 60, 52, 0}
+		wantOver := []bool{false, false, true, true, false}
+		if len(got.Axles) != 5 {
+			return fmt.Errorf("期望 5 轴结果，实际 %d", len(got.Axles))
+		}
+		var overAxles []int
+		for i := range wantOver {
+			a := got.Axles[i]
+			if a.TotalKg != 2000 || a.ImbalancePermille != wantPermille[i] || a.OverTolerance != wantOver[i] {
+				return fmt.Errorf("第 %d 轴不符：期望 2000/%d‰/%v，实际 %+v",
+					i+1, wantPermille[i], wantOver[i], a)
+			}
+			if a.OverTolerance {
+				overAxles = append(overAxles, i+1)
+			}
+		}
+		if len(overAxles) != 2 || overAxles[0] != 3 || overAxles[1] != 4 {
+			return fmt.Errorf("超界轴应按轴序为 [3 4]，实际 %v", overAxles)
+		}
+		if got.Conclusion != "要求复检" {
+			return fmt.Errorf("期望要求复检，实际 %q", got.Conclusion)
+		}
+		return nil
+	})
+
+	// 两侧数组长度不一致：统一 422，只返回错误信封，不夹带任何轴结果。
+	check("轮重平衡：两侧数组长度不一致时只出现错误信封", func() error {
+		cases := []map[string]any{
+			{
+				"left_wheel_loads_kg":  []int{1000, 1000},
+				"right_wheel_loads_kg": []int{1000},
+				"tolerance_permille":   50,
+			},
+			{
+				"left_wheel_loads_kg":  []int{1000},
+				"right_wheel_loads_kg": []int{1000, 1000},
+				"tolerance_permille":   50,
+			},
+		}
+		for i, payload := range cases {
+			code, body, err := postJSON(ctx, client, base+"/api/v1/wheel-balance", payload)
+			if err != nil {
+				return err
+			}
+			if err := assertWheelBalanceEnvelope(code, body); err != nil {
+				return fmt.Errorf("情形 %d: %w", i+1, err)
+			}
+		}
+		return nil
+	})
+
+	// 字段缺失、null、类型错误、空数组、单项越界、阈值越界、单轴总重超 300000、
+	// 未知字段（含大小写变体）：全部 422 且只有错误信封，绝不附带部分评估。
+	check("轮重平衡：非法输入统一 422 且无部分评估", func() error {
+		cases := []struct {
+			name string
+			raw  string
+		}{
+			{"缺左轮字段", `{"right_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"缺右轮字段", `{"left_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"缺阈值字段", `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":[1000]}`},
+			{"左轮为 null", `{"left_wheel_loads_kg":null,"right_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"右轮为 null", `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":null,"tolerance_permille":50}`},
+			{"阈值为 null", `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":[1000],"tolerance_permille":null}`},
+			{"数组元素为 null", `{"left_wheel_loads_kg":[null],"right_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"数组元素为字符串", `{"left_wheel_loads_kg":["1000"],"right_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"数组元素为小数", `{"left_wheel_loads_kg":[1000.5],"right_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"阈值为字符串", `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":[1000],"tolerance_permille":"50"}`},
+			{"两侧均为空数组", `{"left_wheel_loads_kg":[],"right_wheel_loads_kg":[],"tolerance_permille":50}`},
+			{"13 轴", `{"left_wheel_loads_kg":[1,1,1,1,1,1,1,1,1,1,1,1,1],"right_wheel_loads_kg":[1,1,1,1,1,1,1,1,1,1,1,1,1],"tolerance_permille":50}`},
+			{"单项载荷为零", `{"left_wheel_loads_kg":[0],"right_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"单项载荷超 200000", `{"left_wheel_loads_kg":[200001],"right_wheel_loads_kg":[1],"tolerance_permille":50}`},
+			{"阈值为负", `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":[1000],"tolerance_permille":-1}`},
+			{"阈值超 1000", `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":[1000],"tolerance_permille":1001}`},
+			{"单轴总重超 300000", `{"left_wheel_loads_kg":[200000],"right_wheel_loads_kg":[100001],"tolerance_permille":50}`},
+			{"未知字段", `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":[1000],"tolerance_permille":50,"extra":1}`},
+			{"大写字段变体", `{"LEFT_WHEEL_LOADS_KG":[1000],"right_wheel_loads_kg":[1000],"tolerance_permille":50}`},
+			{"JSON 语法损坏", `{"left_wheel_loads_kg":[1000],`},
+		}
+		for _, tc := range cases {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/wheel-balance",
+				bytes.NewReader([]byte(tc.raw)))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return fmt.Errorf("%s: %w", tc.name, err)
+			}
+			bad, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if err := assertWheelBalanceEnvelope(resp.StatusCode, bad); err != nil {
+				return fmt.Errorf("%s: %w（响应 %s）", tc.name, err, bad)
+			}
+		}
+		return nil
+	})
+
+	// 非 JSON 媒体类型（如 text/plain）与缺失 Content-Type：即使载荷合法也按
+	// JSON 请求契约 422 拒绝，不生成任何轮重评估结论。
+	check("轮重平衡：非 JSON 媒体类型提交被 422 拒绝", func() error {
+		raw := `{"left_wheel_loads_kg":[1000],"right_wheel_loads_kg":[1000],"tolerance_permille":50}`
+		for _, ct := range []string{"text/plain", ""} {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/wheel-balance",
+				bytes.NewReader([]byte(raw)))
+			if ct != "" {
+				req.Header.Set("Content-Type", ct)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return err
+			}
+			bad, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if err := assertWheelBalanceEnvelope(resp.StatusCode, bad); err != nil {
+				return fmt.Errorf("Content-Type=%q: %w", ct, err)
+			}
+		}
+		return nil
+	})
+
+	// 同一份轮重请求两次，响应必须逐字节一致（可重复、唯一执法结论）。
+	check("轮重平衡：相同输入两次响应逐字节一致", func() error {
+		req := map[string]any{
+			"left_wheel_loads_kg":  []int{1040, 1050, 1060, 948, 1000},
+			"right_wheel_loads_kg": []int{960, 950, 940, 1052, 1000},
+			"tolerance_permille":   50,
+		}
+		_, first, err := postJSON(ctx, client, base+"/api/v1/wheel-balance", req)
+		if err != nil {
+			return err
+		}
+		_, second, err := postJSON(ctx, client, base+"/api/v1/wheel-balance", req)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(first, second) {
+			return fmt.Errorf("响应不一致:\n%s\n%s", first, second)
+		}
+		return nil
+	})
+
 	if failures > 0 {
 		fmt.Printf("\n验收未通过：%d 项失败\n", failures)
 		os.Exit(1)
@@ -1216,6 +1473,27 @@ func checkBridgeWindowRaw(ctx context.Context, client *http.Client, base, rawBod
 		got.LastAxle != want.lastAxle || got.DisplacementMm.String() != want.displacementMm ||
 		got.Conclusion != want.conclusion {
 		return fmt.Errorf("分析结果不符: 期望 %+v，实际 %+v", want, got)
+	}
+	return nil
+}
+
+// assertWheelBalanceEnvelope 断言轮重平衡入口的失败响应：HTTP 422、
+// 只有 {"error":...} 信封，不含 axles/conclusion 等任何评估产物。
+func assertWheelBalanceEnvelope(code int, body []byte) error {
+	if code != http.StatusUnprocessableEntity {
+		return fmt.Errorf("期望 422，实际 %d，响应 %s", code, body)
+	}
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+		return fmt.Errorf("422 响应缺少 error 字段: %s", body)
+	}
+	for _, kw := range []string{"axles", "conclusion", "total_kg",
+		"imbalance_permille", "over_tolerance"} {
+		if bytes.Contains(body, []byte(kw)) {
+			return fmt.Errorf("422 响应夹带了评估结果（%s）: %s", kw, body)
+		}
 	}
 	return nil
 }

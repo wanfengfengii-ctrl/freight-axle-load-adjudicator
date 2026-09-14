@@ -6,10 +6,14 @@
 核定载荷，即可在车辆上桥前判断任一时刻落在有效桥面的轴载合计是否超过现场核定值；
 取得峰值结论后还可提交车辆匀速通过的预计车速，由入口在相邻事件位移之间切分**恒定载荷
 区段**，给出超载区段与累计暴露毫秒数。
+还设有独立的**左右轮重平衡评估**入口：货车通过便携轮重仪后，值守人员提交一至十二轴的
+左右轮载荷与允许偏差千分比，系统以全程整数的交叉乘法给出不受浮点舍入影响的侧向失衡
+结论，任一轴超界即要求复检。
 
 - 语言 / 框架：Go 1.25 + Gin
 - 裁决代码独立于 HTTP，全部规则以 testify 测试锁定（`internal/verify/verify_test.go`）
 - 桥面承载窗口分析为独立领域包（`internal/bridge`），不调用轴组裁决与重测比对
+- 左右轮重平衡评估为独立领域包（`internal/wheelbalance`），不调用轴组裁决、重测比对与桥面分析
 - 无数据库、无外部依赖，单容器即可运行
 
 ---
@@ -50,7 +54,10 @@ Compose 中定义了名为 **`verify`** 的一次性服务：它等待 API 就�
 边界恰好容纳前后轴计入载荷、平移后峰值触发拦停、并列峰值选择最早事件、
 位置重复只返回错误信封；携带预计车速时还验收持续超载区段载荷与向上取整时长、
 载荷变化时不同恒定载荷区段不合并、同位移瞬时超载只影响原峰值且累计为零，
-以及省略车速时既有响应字节不变），
+以及省略车速时既有响应字节不变；
+最后验收左右轮重平衡评估的完全平衡放行、恰好等于阈值放行、超阈值时按轴序返回
+全部超界轴并要求复检、两侧数组长度不一致与其它非法输入只出现错误信封、
+非 JSON 媒体类型拒绝及响应可重复性），
 全部通过则退出码 0。
 
 ```bash
@@ -399,6 +406,77 @@ curl -s -X POST localhost:8080/api/v1/bridge-window \
 422 响应中绝不出现 `max_load_kg` / `first_axle` / `last_axle` / `displacement_mm` /
 `conclusion` / `overload_segments` / `total_overload_duration_ms`。
 
+### `POST /api/v1/wheel-balance`（左右轮重平衡评估）
+
+货车通过便携轮重仪后，左右轮读数可能显示单轴偏载。值守人员提交按车头到车尾排列的
+各轴左右轮载荷与允许偏差千分比，本入口逐轴评估侧向失衡并在放行前给出全车结论。
+本入口为独立模块，不调用轴组裁决、重测比对与桥面承载窗口分析。
+
+- `Content-Type: application/json`（其它媒体类型或缺失该头，一律 422）
+- 请求体为单个 JSON 对象，未知字段一律 422；字段名须与下表**逐字符一致**，
+  大小写变体同样视为未知字段
+
+| 字段 | 类型 | 含义 | 约束 |
+| --- | --- | --- | --- |
+| `left_wheel_loads_kg` | 整数数组 | 按车头到车尾排列的各轴**左轮**载荷，千克 | 必填；轴数 1～12；每项 1～200000 整数，不允许 `null` |
+| `right_wheel_loads_kg` | 整数数组 | 按车头到车尾排列的各轴**右轮**载荷，千克 | 必填；项数必须与左轮一致；每项 1～200000 整数，不允许 `null` |
+| `tolerance_permille` | 整数 | 允许偏差**千分比**（如 50 表示 50‰） | 必填；0～1000 的整数 |
+
+任一约束不满足（含字段缺失、`null`、类型错误、空数组、轴数超出 1～12、
+两侧数组长度不一致、单项载荷越界、任一轴总轮重超过 **300000** 千克、阈值越界）都
+**统一返回 HTTP 422**，响应体只有错误信封 `{"error": ...}`，
+**不会给出任何部分评估结果**。
+
+### 评估规则（已由测试锁定，非占位实现）
+
+1. 对每一轴计算总轮重 `total = 左轮 + 右轮` 与左右差值绝对值 `diff = |左轮 − 右轮|`。
+2. 是否超界采用**交叉乘法**整数判定：`diff × 1000 > total × tolerance_permille`
+   才算超界；**恰好相等时放行**。全程不使用浮点除法，边界结论不受舍入影响。
+3. 上报的偏差千分比按 **`ceil(diff × 1000 / total)` 向上取整**为整数。
+   注意取整只用于展示：某轴上报千分比恰好等于阈值时，超界判定仍以第 2 条的精确
+   交叉乘法为准（例如总重 9999、差 1、阈值 1‰ 时上报 1‰ 但不超界）。
+4. 全车结论：**全部轴都不超界为 `放行`，任一轴超界为 `要求复检`**；
+   各轴结果按提交顺序（车头到车尾）返回，超界轴即其中 `over_tolerance` 为 `true` 的项。
+
+### 成功响应（HTTP 200）
+
+```bash
+# 五轴车、阈值 50‰：第 3、4 轴超界（总重均为 2000kg，差值 120/104kg）
+curl -s -X POST localhost:8080/api/v1/wheel-balance \
+  -H 'Content-Type: application/json' \
+  -d '{"left_wheel_loads_kg":[1040,1050,1060,948,1000],"right_wheel_loads_kg":[960,950,940,1052,1000],"tolerance_permille":50}'
+```
+
+```json
+{
+  "axles": [
+    {"total_kg": 2000, "imbalance_permille": 40, "over_tolerance": false},
+    {"total_kg": 2000, "imbalance_permille": 50, "over_tolerance": false},
+    {"total_kg": 2000, "imbalance_permille": 60, "over_tolerance": true},
+    {"total_kg": 2000, "imbalance_permille": 52, "over_tolerance": true},
+    {"total_kg": 2000, "imbalance_permille": 0,  "over_tolerance": false}
+  ],
+  "conclusion": "要求复检"
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `axles[].total_kg` | 该轴左右轮总重，整数求和 |
+| `axles[].imbalance_permille` | 偏差千分比，`ceil(|左−右|×1000/总重)`，向上取整 |
+| `axles[].over_tolerance` | 是否超出允许偏差；`diff×1000` **恰好等于** `总重×阈值` 时为 `false` |
+| `conclusion` | **`放行`**（全部轴不超界）或 **`要求复检`**（任一轴超界） |
+
+### 错误响应（HTTP 422）
+
+```json
+{ "error": "左右轮载荷数组长度必须一致：左轮为 2 项，右轮为 1 项" }
+```
+
+422 响应中绝不出现 `axles` / `conclusion` / `total_kg` / `imbalance_permille` /
+`over_tolerance`。本入口不改变既有行为：三个既有业务入口、`GET /healthz`、
+镜像结构与 `API_PORT` 宿主端口覆盖均保持原样。
+
 ---
 
 ## 3. 项目结构
@@ -410,10 +488,14 @@ internal/verify/verify.go   轴组划分与超限裁决（纯逻辑，无占位�
 internal/verify/verify_test.go        testify 锁定全部裁决规则
 internal/bridge/bridge.go             桥面承载窗口分析（独立领域包，纯逻辑）
 internal/bridge/bridge_test.go        testify 锁定窗口扫描与并列裁决规则
+internal/wheelbalance/wheelbalance.go 左右轮重平衡评估（独立领域包，纯整数逻辑）
+internal/wheelbalance/wheelbalance_test.go testify 锁定交叉乘法边界与向上取整规则
 internal/httpapi/handler.go           Gin 路由、请求解析与 422 处理
 internal/httpapi/bridge.go            桥面承载窗口分析入口的 Gin 处理
+internal/httpapi/wheelbalance.go      左右轮重平衡评估入口的 Gin 处理
 internal/httpapi/handler_test.go      HTTP 契约测试（200/422/字段顺序）
 internal/httpapi/bridge_test.go       桥面窗口 HTTP 契约测试
+internal/httpapi/wheelbalance_test.go 轮重平衡 HTTP 契约测试
 Dockerfile                  多阶段构建，distroless 运行镜像
 docker-compose.yml          api 常驻服务 + verify 一次性验收服务
 ```
@@ -432,7 +514,7 @@ docker-compose.yml          api 常驻服务 + verify 一次性验收服务
 | 差额分摊 | 按原载荷比例向下取整，余数按小数部分降序、轴序号升序逐轴补 1 |
 | 超限清单顺序 | 组按序号升序，整车固定最后 |
 | 非法输入 | 一律 422，仅 `{"error": ...}`，无部分结果 |
-| 媒体类型 | 两个 POST 入口均要求 `Content-Type: application/json`，媒体类型不符或缺失一律 422 |
+| 媒体类型 | 四个 POST 入口均要求 `Content-Type: application/json`，媒体类型不符或缺失一律 422 |
 | 字段名 | 须与契约逐字符一致；大小写变体（如 `AXLE_LOADS_KG`）按未知字段 422 拒绝 |
 | 重测比对 | `POST /api/v1/retest-comparison`：两份同契约数据、轴数须相同，各走既有裁决链路；返回两份完整结果、按首轴排序的分组边界/超限状态变化区间、整车结论翻转与最终 `结论确认`/`结论改变` |
 | 重测比对非法 | 任一份非法或轴数不一致整体 422，错误指明首次或重测，不夹带另一份裁决结果 |
@@ -443,3 +525,7 @@ docker-compose.yml          api 常驻服务 + verify 一次性验收服务
 | 桥面窗口非法 | 一律 422，仅 `{"error": ...}`，不生成任何分析结果（含车速产物） |
 | 桥面窗口车速 | 选填 `speed_mm_per_s`，1～50000 毫米每秒整数；缺省或 `null` 时不计算、成功响应逐字节不变；类型错误、为零或越界均 422 |
 | 桥面窗口超载区段 | 复用进入/离开事件，在相邻事件位移间切分恒定载荷区段；只保留长度 > 0 且载荷 > 核定值的区段，相邻同载荷先合并；每项给起止位移（含/不含）、恒定载荷与 `ceil(位移差×1000/车速)` 毫秒；同位移瞬时峰值参与原峰值裁决但不进入区段、不计累计 |
+| 轮重平衡入口 | `POST /api/v1/wheel-balance`：独立模块，不调用轴组裁决、重测比对与桥面分析；1～12 轴、左右数组等长、每项 1～200000kg、单轴总重 ≤ 300000kg、阈值 0～1000 整数 |
+| 轮重平衡超界 | 纯整数交叉乘法：`|左−右|×1000 > 总轮重×阈值` 才超界，**恰好相等放行**；上报千分比按 `ceil(|左−右|×1000/总轮重)` 向上取整，取整不影响超界判定 |
+| 轮重平衡结论 | 各轴按轴序给 `total_kg` / `imbalance_permille` / `over_tolerance`；全部不超界为 `放行`，任一轴超界为 `要求复检` |
+| 轮重平衡非法 | 一律 422，仅 `{"error": ...}`，不附带任何部分评估（含字段缺失、`null`、类型错误、长度不一致、单项或单轴总重越界、阈值越界、非 JSON 媒体类型） |
